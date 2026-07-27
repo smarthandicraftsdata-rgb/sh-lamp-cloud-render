@@ -1,0 +1,33 @@
+SH LAMP CLOUD — EXACT GITHUB UPLOAD
+
+1. Create a new empty GitHub repository named:
+   sh-lamp-cloud-render
+
+2. Extract SH_Lamp_Phase3A_Render_Backend_GitHub.zip.
+
+3. Open the extracted folder and upload ALL items inside it to the repository root.
+   Do not upload only the ZIP file.
+   Do not place the files inside another nested folder.
+
+The GitHub repository root must directly contain:
+
+  .env.example
+  .gitignore
+  .node-version
+  FILE_LIST.txt
+  README.md
+  UPLOAD_TO_GITHUB.txt
+  VALIDATION_REPORT.txt
+  package.json
+  render.yaml
+  tsconfig.json
+  docs/
+  prisma/
+  src/
+
+4. Commit to the main branch.
+
+5. Follow docs/RENDER_SETUP.md exactly.
+
+Never upload a real .env file, DATABASE_URL, ACCESS_TOKEN_SECRET, ADMIN_SETUP_KEY,
+deviceSecret, access token, refresh token, or customer password to GitHub.

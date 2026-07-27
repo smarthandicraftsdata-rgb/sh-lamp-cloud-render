@@ -1,0 +1,35 @@
+SH Lamp Phase 3A Render Backend — Validation Report
+Date: 2026-07-27
+
+PASSED
+- package.json parsed as valid JSON.
+- tsconfig.json parsed as valid JSON.
+- render.yaml parsed successfully as YAML.
+- All relative TypeScript imports resolve to files in the repository.
+- 14 TypeScript source files transpiled without syntax diagnostics.
+- Every transpiled JavaScript file passed Node.js --check.
+- Prisma schema defines 9 models and the SQL migration creates the same 9 tables.
+- Prisma migration_lock.toml is included for PostgreSQL.
+- No real .env file or embedded deployment secret is included.
+- Render service binds through PORT and host 0.0.0.0.
+- Health-check route is /health.
+- WebSocket routes are /ws/app and /ws/device on the same HTTP server.
+
+DESIGN CHECKS
+- Access tokens are short-lived JWTs.
+- Refresh tokens are opaque, hashed in the database, and rotated.
+- Passwords use bcryptjs with configurable work factor.
+- Device secrets and claim codes are stored only as SHA-256 hashes.
+- Device commands have unique IDs, expiry, delivery status, and acknowledgements.
+- App and device WebSockets authenticate after connection and have a 10-second auth timeout.
+- Dead WebSockets are detected with ping/pong.
+- Lamp access is checked against ownership or home membership.
+- Existing local Wi-Fi/BLE firmware and Android files are not modified by this backend package.
+
+NOT EXECUTED IN THIS ENVIRONMENT
+- npm install and the complete dependency-aware TypeScript build.
+- prisma generate using downloaded Prisma packages.
+- prisma migrate deploy against a live Render PostgreSQL database.
+- End-to-end Android/ESP32 cloud communication.
+
+Those final checks occur during the first Render build and the following Phase 3 Android/R9 firmware integration. Any Render build error must be handled from its exact deployment log before moving ahead.
