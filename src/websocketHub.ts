@@ -3,7 +3,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "./db";
-import { normalizeLampId, secretsEqual, verifyAccessToken } from "./security";
+import { normalizeLampId, randomCommandId, secretsEqual, verifyAccessToken } from "./security";
 import { allowedActions, createAndDispatchCommand } from "./commandService";
 
 interface SocketMeta {
@@ -24,7 +24,7 @@ const deviceAuthSchema = z.object({
   deviceSecret: z.string().min(20)
 });
 const appCommandSchema = z.object({
-  type: z.literal("command"),
+  type: z.enum(["command", "liveCommand"]),
   lampId: z.string(),
   commandId: z.string().min(8).max(100).optional(),
   action: z.string().min(1).max(40),
@@ -37,6 +37,19 @@ const deviceStateSchema = z.object({
   fadeMode: z.number().int().min(0).max(20).default(0),
   timerRemaining: z.number().int().min(0).max(604800).default(0),
   firmwareVersion: z.string().max(40).optional(),
+  batteryValid: z.boolean().optional(),
+  batteryPercent: z.number().int().min(0).max(100).optional(),
+  batteryInternalPercent: z.number().int().min(0).max(100).optional(),
+  batteryEstimatedPercent: z.number().int().min(0).max(100).optional(),
+  batteryCharging: z.boolean().optional(),
+  batteryFullQualified: z.boolean().optional(),
+  batteryVoltageMv: z.number().int().min(0).max(10000).optional(),
+  batteryEstimatedVoltageMv: z.number().int().min(0).max(10000).optional(),
+  batteryState: z.string().max(40).optional(),
+  batteryProtection: z.string().max(40).optional(),
+  batteryWarningActive: z.boolean().optional(),
+  powerMode: z.string().max(40).optional(),
+  runtimeState: z.string().max(40).optional(),
   raw: z.json().optional()
 });
 const deviceAckSchema = z.object({
@@ -53,6 +66,7 @@ export class WebSocketHub {
   private readonly appSockets = new Map<string, Set<ManagedSocket>>();
   private readonly deviceSockets = new Map<string, ManagedSocket>();
   private heartbeatTimer?: NodeJS.Timeout;
+  private commandRetryTimer?: NodeJS.Timeout;
 
   attach(server: HttpServer): void {
     server.on("upgrade", (request, socket, head) => {
@@ -71,6 +85,8 @@ export class WebSocketHub {
 
     this.heartbeatTimer = setInterval(() => this.checkHeartbeats(), 30_000);
     this.heartbeatTimer.unref();
+    this.commandRetryTimer = setInterval(() => void this.retryUnacknowledgedCommands(), 2_000);
+    this.commandRetryTimer.unref();
   }
 
   private accept(socket: ManagedSocket, _request: IncomingMessage, kind: "app" | "device"): void {
@@ -133,7 +149,15 @@ export class WebSocketHub {
           include: { state: true, home: true, room: true },
           orderBy: { displayName: "asc" }
         });
-        this.send(socket, { type: "authOk", connection: "app", userId: token.sub, devices });
+        this.send(socket, {
+          type: "authOk",
+          connection: "app",
+          userId: token.sub,
+          devices: devices.map((device) => ({
+            ...device,
+            state: this.stateForApp(device.state)
+          }))
+        });
       } else {
         const body = deviceAuthSchema.parse(parsed);
         const lampId = normalizeLampId(body.lampId);
@@ -180,6 +204,30 @@ export class WebSocketHub {
         this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
         return;
       }
+
+      if (body.type === "liveCommand") {
+        // Slider drag traffic is intentionally ephemeral: it is forwarded over
+        // the already-open device WebSocket without creating a DB row for every
+        // intermediate value. The app still sends one durable final `command`
+        // when the drag finishes.
+        const commandId = body.commandId || randomCommandId();
+        const delivered = await this.sendCommandToDevice(lampId, {
+          type: "deviceCommand",
+          commandId,
+          action: body.action,
+          value: body.value ?? null,
+          expiresAt: new Date(Date.now() + 5_000).toISOString()
+        });
+        this.send(socket, {
+          type: "commandAccepted",
+          lampId,
+          commandId,
+          delivered,
+          ephemeral: true
+        });
+        return;
+      }
+
       const result = await createAndDispatchCommand({
         hub: this,
         deviceId: device.id,
@@ -219,14 +267,14 @@ export class WebSocketHub {
                   brightness: state.brightness,
                   fadeMode: state.fadeMode,
                   timerRemaining: state.timerRemaining,
-                  rawJson: (state.raw ?? parsed) as Prisma.InputJsonValue
+                  rawJson: state as Prisma.InputJsonValue
                 },
                 update: {
                   power: state.power,
                   brightness: state.brightness,
                   fadeMode: state.fadeMode,
                   timerRemaining: state.timerRemaining,
-                  rawJson: (state.raw ?? parsed) as Prisma.InputJsonValue
+                  rawJson: state as Prisma.InputJsonValue
                 }
               }
             }
@@ -238,7 +286,7 @@ export class WebSocketHub {
           lampId,
           online: true,
           firmwareVersion: device.firmwareVersion,
-          state: device.state
+          state: this.stateForApp(device.state)
         });
         return;
       }
@@ -246,18 +294,23 @@ export class WebSocketHub {
       if (type === "ack") {
         const ack = deviceAckSchema.parse(parsed);
         const command = await prisma.deviceCommand.findUnique({ where: { commandId: ack.commandId } });
-        if (!command) {
-          this.send(socket, { type: "error", code: "UNKNOWN_COMMAND", message: "Command ID was not found" });
-          return;
+        const device = command
+          ? await prisma.device.findUnique({ where: { id: command.deviceId }, include: { state: true } })
+          : await prisma.device.findUnique({ where: { lampId }, include: { state: true } });
+        if (!device) return;
+
+        if (command) {
+          await prisma.deviceCommand.update({
+            where: { id: command.id },
+            data: {
+              status: ack.success ? "ACKNOWLEDGED" : "FAILED",
+              acknowledgedAt: new Date(),
+              errorMessage: ack.success ? null : ack.error || "Device rejected command"
+            }
+          });
         }
-        await prisma.deviceCommand.update({
-          where: { id: command.id },
-          data: {
-            status: ack.success ? "ACKNOWLEDGED" : "FAILED",
-            acknowledgedAt: new Date(),
-            errorMessage: ack.success ? null : ack.error || "Device rejected command"
-          }
-        });
+
+        let persistedState = device.state;
         if (ack.state) {
           const stateData = {
             power: ack.state.power,
@@ -266,14 +319,14 @@ export class WebSocketHub {
             timerRemaining: ack.state.timerRemaining,
             rawJson: ack.state as Prisma.InputJsonValue
           };
-          await prisma.deviceState.upsert({
-            where: { deviceId: command.deviceId },
-            create: { deviceId: command.deviceId, ...stateData },
+          persistedState = await prisma.deviceState.upsert({
+            where: { deviceId: device.id },
+            create: { deviceId: device.id, ...stateData },
             update: stateData
           });
           if (ack.state.firmwareVersion) {
             await prisma.device.update({
-              where: { id: command.deviceId },
+              where: { id: device.id },
               data: { firmwareVersion: ack.state.firmwareVersion, lastSeen: new Date(), online: true }
             });
           }
@@ -284,7 +337,8 @@ export class WebSocketHub {
           commandId: ack.commandId,
           success: ack.success,
           error: ack.error,
-          state: ack.state
+          ephemeral: !command,
+          state: this.stateForApp(persistedState)
         });
         return;
       }
@@ -317,11 +371,21 @@ export class WebSocketHub {
   private async flushPendingCommands(lampId: string, deviceId: string, socket: ManagedSocket): Promise<void> {
     const now = new Date();
     await prisma.deviceCommand.updateMany({
-      where: { deviceId, status: "PENDING", expiresAt: { lte: now } },
+      where: { deviceId, status: { in: ["PENDING", "SENT"] }, expiresAt: { lte: now } },
       data: { status: "EXPIRED", errorMessage: "Command expired before device connected" }
     });
     const pending = await prisma.deviceCommand.findMany({
-      where: { deviceId, status: "PENDING", expiresAt: { gt: now } },
+      where: {
+        deviceId,
+        expiresAt: { gt: now },
+        OR: [
+          { status: "PENDING" },
+          {
+            status: "SENT",
+            action: { in: ["setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
+          }
+        ]
+      },
       orderBy: { createdAt: "asc" },
       take: 20
     });
@@ -376,6 +440,46 @@ export class WebSocketHub {
     }
   }
 
+  private async retryUnacknowledgedCommands(): Promise<void> {
+    const now = new Date();
+    const retryBefore = new Date(now.getTime() - 5_000);
+
+    // Expire commands even if a device stays connected forever. A SENT command
+    // is not considered complete until its ACK arrives.
+    await prisma.deviceCommand.updateMany({
+      where: { status: { in: ["PENDING", "SENT"] }, expiresAt: { lte: now } },
+      data: { status: "EXPIRED", errorMessage: "Command expired before acknowledgement" }
+    });
+
+    const retryable = await prisma.deviceCommand.findMany({
+      where: {
+        status: "SENT",
+        expiresAt: { gt: now },
+        deliveredAt: { lte: retryBefore },
+        action: { in: ["setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
+      },
+      include: { device: { select: { lampId: true } } },
+      orderBy: { deliveredAt: "asc" },
+      take: 50
+    });
+
+    for (const command of retryable) {
+      const socket = this.deviceSockets.get(command.device.lampId);
+      if (!socket || socket.readyState !== WebSocket.OPEN || !socket.meta?.authenticated) continue;
+      this.send(socket, {
+        type: "deviceCommand",
+        commandId: command.commandId,
+        action: command.action,
+        value: command.valueJson,
+        expiresAt: command.expiresAt.toISOString()
+      });
+      await prisma.deviceCommand.updateMany({
+        where: { id: command.id, status: "SENT" },
+        data: { deliveredAt: new Date(), errorMessage: null }
+      });
+    }
+  }
+
   private checkHeartbeats(): void {
     const sockets = [...this.appServer.clients, ...this.deviceServer.clients] as ManagedSocket[];
     for (const socket of sockets) {
@@ -387,6 +491,46 @@ export class WebSocketHub {
       socket.meta.alive = false;
       socket.ping();
     }
+  }
+
+  private stateForApp(state: {
+    power: boolean;
+    brightness: number;
+    fadeMode: number;
+    timerRemaining: number;
+    rawJson: Prisma.JsonValue | null;
+    updatedAt: Date;
+  } | null): unknown {
+    if (!state) return null;
+    const raw = state.rawJson && typeof state.rawJson === "object" && !Array.isArray(state.rawJson)
+      ? state.rawJson as Record<string, unknown>
+      : {};
+    const nestedRaw = raw.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)
+      ? raw.raw as Record<string, unknown>
+      : {};
+    const pick = (key: string): unknown => raw[key] ?? nestedRaw[key];
+
+    return {
+      power: state.power,
+      brightness: state.brightness,
+      fadeMode: state.fadeMode,
+      timerRemaining: state.timerRemaining,
+      updatedAt: state.updatedAt,
+      batteryValid: pick("batteryValid"),
+      batteryPercent: pick("batteryPercent"),
+      batteryInternalPercent: pick("batteryInternalPercent"),
+      batteryEstimatedPercent: pick("batteryEstimatedPercent"),
+      batteryCharging: pick("batteryCharging"),
+      batteryFullQualified: pick("batteryFullQualified"),
+      batteryVoltageMv: pick("batteryVoltageMv"),
+      batteryEstimatedVoltageMv: pick("batteryEstimatedVoltageMv"),
+      batteryState: pick("batteryState"),
+      batteryProtection: pick("batteryProtection"),
+      batteryWarningActive: pick("batteryWarningActive"),
+      powerMode: pick("powerMode"),
+      runtimeState: pick("runtimeState"),
+      raw
+    };
   }
 
   private send(socket: WebSocket, payload: unknown): void {
