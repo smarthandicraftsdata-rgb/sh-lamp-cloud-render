@@ -1,0 +1,58 @@
+R21A CONTROLLED CHANGE MANIFEST
+===============================
+
+BASELINES
+- ESP: R20E6_BOOT_WIFI_STABLE
+- iOS: 1.6.0 Build Fix 2 Video Sync
+- Render: 2026-08-11 realtime stability backend
+
+UNCHANGED / INTENTIONALLY PRESERVED
+- ESP GPIO4 lamp output role
+- FFE1 BLE control opcodes
+- FFE2 Wi-Fi provisioning/status protocol
+- HTTP port 80 control endpoints
+- Cloud command action names
+- Fade implementation
+- PWM output implementation
+- Battery estimator core
+- R20E FINAL threshold 2903mV
+- R20E emergency threshold 2700mV
+- R20E final confirmation windows = 2
+- R20E recovery threshold 3600mV
+- R20E five-blink warning sequence
+- iOS Build Fix 2 timer ticker / optimistic field holds
+- Power-mode cloud restriction
+
+ADDED / CHANGED
+ESP:
+- BLE-first startup while Wi-Fi joins in background
+- Strong Wi-Fi recovery retained only after repeated auth failures
+- Local WebSocket server :81
+- Local realtime state + command ACK
+- bootId + bootSequence + stateRevision
+- state revision generated for timer-only cancellation/completion
+- active local realtime observer participates in existing app-observation battery sampling cadence
+
+iOS:
+- Version 1.7.0 build 12
+- Persistent Local WebSocket client + HTTP fallback
+- Local polling skipped while WS healthy
+- BLE RSSI read every 3 seconds
+- Automatic BLE/LAN hysteresis
+- Route display/order consistency fixes
+- Version-aware state merge
+- Timer registration gated by version acceptance
+- Live boot-reset recovery rule
+
+Render:
+- Optional bootId / bootSequence / stateRevision accepted and returned
+- No DB migration
+
+DEFERRED TO LATER PHASE
+- Universal command envelope across BLE + LAN + Cloud
+- Cross-transport duplicate suppression
+- Selective micro-hedging
+- BLE v2 revision/command-ID status payload
+- NWBrowser migration
+- Local transport authentication/security upgrade
+- Full APNs remote push

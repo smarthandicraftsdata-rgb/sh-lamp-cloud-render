@@ -1,0 +1,31 @@
+R21A VALIDATION REPORT — 2026-08-11
+===================================
+
+RESULTS
+- iOS Swift source parse: PASS (19 Swift files)
+- Render TypeScript syntax transpile with TS 5.8.3: PASS
+- Firmware lexical delimiter check: PASS
+- Firmware preprocessor balance: PASS
+- Firmware invariant checks: PASS
+- Local WebSocket include/server/startup markers: PASS
+
+BATTERY SAFETY INVARIANTS VERIFIED
+- FINAL threshold = 2903 mV
+- Emergency threshold = 2700 mV
+- FINAL confirmation windows = 2
+- Recovery threshold = 3600 mV
+- Core R20E FINAL start/finish/process functions compared against R20E6 and unchanged
+- PWM writeLampOutput, processFade, setBrightnessTarget, setFadeModeValue, setAutoOffTimer and core low-battery processing compared against R20E6 and unchanged
+
+INTENTIONAL TIMER-STATE CHANGE
+- Timer completion now generates a revision/broadcast even when lamp brightness was already zero.
+- Brightness=0 / power-off timer cancellation now generates a revision when timer was the only state that changed.
+- Physical lamp behavior is unchanged; this closes a cross-transport state-reporting edge.
+
+LIMITATIONS OF THIS VALIDATION
+- No Arduino/ESP32 compiler/toolchain is installed in this environment, so the INO has NOT been compiled against your installed ESP32 core/libraries.
+- No macOS/Xcode environment is available, so iOS has NOT received a full Xcode typecheck/archive here. Codemagic remains the real build test.
+- No live iPhone/ESP/router/Render endurance test has been performed here.
+
+STATUS
+R21A is a controlled one-lamp test candidate, not yet production-ready.
