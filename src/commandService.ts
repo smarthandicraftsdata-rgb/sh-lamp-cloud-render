@@ -4,6 +4,16 @@ import { config } from "./config";
 import { randomCommandId } from "./security";
 import type { WebSocketHub } from "./websocketHub";
 
+const latestWinsActions = new Set(["setPower", "setBrightness", "setFadeMode", "setTimer"]);
+const REALTIME_CONTROL_TTL_MS = 6_000;
+const REQUEST_STATE_TTL_MS = 10_000;
+
+function ttlMsForAction(action: string): number {
+  if (latestWinsActions.has(action)) return Math.min(config.commandTtlSeconds * 1000, REALTIME_CONTROL_TTL_MS);
+  if (action === "requestState") return Math.min(config.commandTtlSeconds * 1000, REQUEST_STATE_TTL_MS);
+  return Math.min(config.commandTtlSeconds * 1000, REALTIME_CONTROL_TTL_MS);
+}
+
 export const allowedActions = new Set([
   "toggle",
   "setPower",
@@ -24,7 +34,7 @@ export async function createAndDispatchCommand(input: {
   commandId?: string;
 }) {
   const commandId = input.commandId || randomCommandId();
-  const expiresAt = new Date(Date.now() + config.commandTtlSeconds * 1000);
+  const expiresAt = new Date(Date.now() + ttlMsForAction(input.action));
   const valueJson = input.value === null ? Prisma.JsonNull : input.value;
 
   // A mobile client can lose its network immediately after submitting a
@@ -64,6 +74,21 @@ export async function createAndDispatchCommand(input: {
       });
     }
     return { commandId, delivered, expiresAt: existing.expiresAt };
+  }
+
+  if (latestWinsActions.has(input.action)) {
+    // RF2: absolute lamp controls are latest-wins. If a previous cloud command
+    // has not been acknowledged yet, do not allow it to replay later and fight
+    // a newer user intent during BLE/LAN/cloud handover.
+    await prisma.deviceCommand.updateMany({
+      where: {
+        deviceId: input.deviceId,
+        action: input.action,
+        status: { in: ["PENDING", "SENT"] },
+        expiresAt: { gt: new Date() }
+      },
+      data: { status: "EXPIRED", errorMessage: "Superseded by newer command" }
+    });
   }
 
   const command = await prisma.deviceCommand.create({

@@ -63,6 +63,9 @@ const deviceAckSchema = z.object({
   state: deviceStateSchema.omit({ type: true }).optional()
 });
 
+const latestWinsActions = ["setPower", "setBrightness", "setFadeMode", "setTimer"];
+const STALE_CONTROL_AGE_MS = 6_000;
+
 export class WebSocketHub {
   private readonly appServer = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 });
   private readonly deviceServer = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 });
@@ -373,6 +376,18 @@ export class WebSocketHub {
 
   private async flushPendingCommands(lampId: string, deviceId: string, socket: ManagedSocket): Promise<void> {
     const now = new Date();
+    const staleControlBefore = new Date(now.getTime() - STALE_CONTROL_AGE_MS);
+    // RF2 migration guard: older deployments could leave 120-second absolute
+    // controls queued. Never execute those after a route handover.
+    await prisma.deviceCommand.updateMany({
+      where: {
+        deviceId,
+        status: { in: ["PENDING", "SENT"] },
+        action: { in: latestWinsActions },
+        createdAt: { lte: staleControlBefore }
+      },
+      data: { status: "EXPIRED", errorMessage: "Stale control command expired during RF2 handover protection" }
+    });
     await prisma.deviceCommand.updateMany({
       where: { deviceId, status: { in: ["PENDING", "SENT"] }, expiresAt: { lte: now } },
       data: { status: "EXPIRED", errorMessage: "Command expired before device connected" }
@@ -446,6 +461,16 @@ export class WebSocketHub {
   private async retryUnacknowledgedCommands(): Promise<void> {
     const now = new Date();
     const retryBefore = new Date(now.getTime() - 5_000);
+    const staleControlBefore = new Date(now.getTime() - STALE_CONTROL_AGE_MS);
+
+    await prisma.deviceCommand.updateMany({
+      where: {
+        status: { in: ["PENDING", "SENT"] },
+        action: { in: latestWinsActions },
+        createdAt: { lte: staleControlBefore }
+      },
+      data: { status: "EXPIRED", errorMessage: "Stale control command expired during RF2 handover protection" }
+    });
 
     // Expire commands even if a device stays connected forever. A SENT command
     // is not considered complete until its ACK arrives.
