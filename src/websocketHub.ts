@@ -13,6 +13,7 @@ interface SocketMeta {
   lampId?: string;
   alive: boolean;
   authTimer: NodeJS.Timeout;
+  accessibleLampIds?: Set<string>;
 }
 
 type ManagedSocket = WebSocket & { meta?: SocketMeta };
@@ -107,6 +108,11 @@ export class WebSocketHub {
   private readonly deviceSockets = new Map<string, ManagedSocket>();
   private readonly deviceSendChains = new Map<string, Promise<void>>();
   private readonly deviceMessageChains = new Map<string, Promise<void>>();
+  // RF5.3: remember short-lived slider command IDs so ACKs from older RF5
+  // firmware can be discarded without Prisma writes. New RF5.3 firmware does
+  // not ACK ephemeral frames at all, but this keeps a mixed deployment safe.
+  private readonly ephemeralCommands = new Map<string, { lampId: string; expiresAt: number }>();
+  private readonly ephemeralStateSuppressUntil = new Map<string, number>();
   private heartbeatTimer?: NodeJS.Timeout;
   private commandRetryTimer?: NodeJS.Timeout;
 
@@ -211,6 +217,10 @@ export class WebSocketHub {
           include: { state: true, home: true, room: true },
           orderBy: { displayName: "asc" }
         });
+        // RF5.3: authorization for the lamps visible at authentication time is
+        // cached on this authenticated socket. Slider liveCommand frames no
+        // longer perform one Prisma authorization query per finger movement.
+        socket.meta.accessibleLampIds = new Set(devices.map((device) => normalizeLampId(device.lampId)));
         this.send(socket, {
           type: "authOk",
           connection: "app",
@@ -256,15 +266,26 @@ export class WebSocketHub {
         return;
       }
       const lampId = normalizeLampId(body.lampId);
-      const device = await prisma.device.findFirst({
-        where: {
-          lampId,
-          OR: [{ ownerId: socket.meta!.userId }, { home: { members: { some: { userId: socket.meta!.userId } } } }]
+      let deviceId: string | undefined;
+      const accessCache = socket.meta!.accessibleLampIds;
+      if (!accessCache?.has(lampId)) {
+        // A lamp may be claimed or shared after this WebSocket authenticated.
+        // Misses are revalidated against Prisma once, then added to the socket
+        // cache; known lamps take the zero-query fast path.
+        const device = await prisma.device.findFirst({
+          where: {
+            lampId,
+            OR: [{ ownerId: socket.meta!.userId }, { home: { members: { some: { userId: socket.meta!.userId } } } }]
+          },
+          select: { id: true }
+        });
+        if (!device) {
+          this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
+          return;
         }
-      });
-      if (!device) {
-        this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
-        return;
+        deviceId = device.id;
+        if (accessCache) accessCache.add(lampId);
+        else socket.meta!.accessibleLampIds = new Set([lampId]);
       }
 
       if (body.type === "liveCommand") {
@@ -273,13 +294,22 @@ export class WebSocketHub {
         // intermediate value. The app still sends one durable final `command`
         // when the drag finishes.
         const commandId = body.commandId || randomCommandId();
+        const now = Date.now();
+        if (this.ephemeralCommands.size > 1024) {
+          for (const [id, item] of this.ephemeralCommands) {
+            if (item.expiresAt <= now) this.ephemeralCommands.delete(id);
+          }
+        }
+        this.ephemeralCommands.set(commandId, { lampId, expiresAt: now + 5_000 });
         const delivered = await this.sendCommandToDevice(lampId, {
           type: "deviceCommand",
           commandId,
           action: body.action,
           value: body.value ?? null,
-          expiresAt: new Date(Date.now() + 1_500).toISOString()
+          ephemeral: true,
+          expiresAt: new Date(now + 1_500).toISOString()
         });
+        if (!delivered) this.ephemeralCommands.delete(commandId);
         this.send(socket, {
           type: "commandAccepted",
           lampId,
@@ -290,9 +320,22 @@ export class WebSocketHub {
         return;
       }
 
+      if (!deviceId) {
+        const durableDevice = await prisma.device.findUnique({ where: { lampId }, select: { id: true } });
+        if (!durableDevice) {
+          this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
+          return;
+        }
+        deviceId = durableDevice.id;
+      }
+      const resolvedDeviceId = deviceId;
+      if (!resolvedDeviceId) {
+        this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
+        return;
+      }
       const result = await createAndDispatchCommand({
         hub: this,
-        deviceId: device.id,
+        deviceId: resolvedDeviceId,
         lampId,
         userId: socket.meta!.userId!,
         action: body.action,
@@ -319,6 +362,14 @@ export class WebSocketHub {
 
       if (type === "state") {
         const state = deviceStateSchema.parse(parsed);
+        const suppressUntil = this.ephemeralStateSuppressUntil.get(lampId) || 0;
+        if (suppressUntil > Date.now()) {
+          // Old RF5 firmware sends a full state immediately after each live
+          // slider ACK. The final durable command/ACK persists authoritative
+          // state, so suppress this redundant write/broadcast burst.
+          return;
+        }
+        if (suppressUntil) this.ephemeralStateSuppressUntil.delete(lampId);
         if (!shouldAcceptState(currentDevice.state?.rawJson, state as unknown as Record<string, unknown>)) {
           await prisma.device.update({ where: { id: currentDevice.id }, data: { online: true, lastSeen: new Date() } });
           return;
@@ -363,6 +414,7 @@ export class WebSocketHub {
       if (type === "ack") {
         const ack = deviceAckSchema.parse(parsed);
         const command = await prisma.deviceCommand.findUnique({ where: { commandId: ack.commandId } });
+        const ephemeral = command ? undefined : this.ephemeralCommands.get(ack.commandId);
 
         // A command ID is globally unique. An ACK from any other authenticated
         // lamp must not update that command or satisfy the owning app waiter.
@@ -373,6 +425,26 @@ export class WebSocketHub {
             message: "commandId belongs to a different lamp"
           });
           console.warn(`Rejected wrong-device ACK ${ack.commandId} from ${lampId}`);
+          return;
+        }
+
+        if (ephemeral && ephemeral.lampId !== lampId) {
+          this.ephemeralCommands.delete(ack.commandId);
+          this.send(socket, {
+            type: "error",
+            code: "WRONG_DEVICE_EPHEMERAL_ACK",
+            message: "ephemeral commandId belongs to a different lamp"
+          });
+          return;
+        }
+
+        if (ephemeral) {
+          // RF5.3 mixed-deployment protection: RF5/RF5.1 devices ACK every
+          // slider frame with a full state snapshot. Do not turn that into two
+          // Prisma writes + account broadcasts per frame. The final released
+          // value is still a durable command and persists authoritative state.
+          this.ephemeralCommands.delete(ack.commandId);
+          this.ephemeralStateSuppressUntil.set(lampId, Date.now() + 350);
           return;
         }
 
