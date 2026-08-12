@@ -34,6 +34,7 @@ const deviceStateSchema = z.object({
   type: z.literal("state"),
   power: z.boolean(),
   brightness: z.number().int().min(0).max(100),
+  rememberedBrightness: z.number().int().min(1).max(100).optional(),
   fadeMode: z.number().int().min(0).max(20).default(0),
   timerRemaining: z.number().int().min(0).max(604800).default(0),
   firmwareVersion: z.string().max(40).optional(),
@@ -59,18 +60,53 @@ const deviceAckSchema = z.object({
   type: z.literal("ack"),
   commandId: z.string().min(8).max(100),
   success: z.boolean(),
+  applied: z.boolean().optional(),
+  duplicate: z.boolean().optional(),
+  ignoredReason: z.string().max(80).optional(),
   error: z.string().max(200).optional(),
   state: deviceStateSchema.omit({ type: true }).optional()
 });
 
-const latestWinsActions = ["setPower", "setBrightness", "setFadeMode", "setTimer"];
-const STALE_CONTROL_AGE_MS = 6_000;
+const latestWinsActions = ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer"];
+const STALE_CONTROL_AGE_MS = 2_000;
+const MAX_SOCKET_BUFFERED_BYTES = 256 * 1024;
+
+function objectValue(value: Prisma.JsonValue | null | undefined): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function numeric(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function stateOrderFromRaw(value: Prisma.JsonValue | null | undefined): { bootId?: number; bootSequence?: number; revision?: number } {
+  const raw = objectValue(value);
+  const nested = objectValue(raw.raw as Prisma.JsonValue | undefined);
+  return {
+    bootId: numeric(raw.bootId ?? raw.stateBootId ?? nested.bootId ?? nested.stateBootId),
+    bootSequence: numeric(raw.bootSequence ?? raw.stateBootSequence ?? nested.bootSequence ?? nested.stateBootSequence),
+    revision: numeric(raw.stateRevision ?? raw.revision ?? nested.stateRevision ?? nested.revision)
+  };
+}
+
+function shouldAcceptState(currentRaw: Prisma.JsonValue | null | undefined, incoming: Record<string, unknown>): boolean {
+  const current = stateOrderFromRaw(currentRaw);
+  const incomingOrder = stateOrderFromRaw(incoming as Prisma.JsonValue);
+  if (current.bootSequence === undefined || current.revision === undefined ||
+      incomingOrder.bootSequence === undefined || incomingOrder.revision === undefined) return true;
+  if (incomingOrder.bootSequence > current.bootSequence) return true;
+  if (incomingOrder.bootSequence < current.bootSequence) return false;
+  if (current.bootId !== undefined && incomingOrder.bootId !== undefined && current.bootId !== incomingOrder.bootId) return false;
+  return incomingOrder.revision >= current.revision;
+}
 
 export class WebSocketHub {
   private readonly appServer = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 });
   private readonly deviceServer = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 });
   private readonly appSockets = new Map<string, Set<ManagedSocket>>();
   private readonly deviceSockets = new Map<string, ManagedSocket>();
+  private readonly deviceSendChains = new Map<string, Promise<void>>();
+  private readonly deviceMessageChains = new Map<string, Promise<void>>();
   private heartbeatTimer?: NodeJS.Timeout;
   private commandRetryTimer?: NodeJS.Timeout;
 
@@ -134,7 +170,27 @@ export class WebSocketHub {
     if (socket.meta.kind === "app") {
       await this.handleAppMessage(socket, parsed);
     } else {
-      await this.handleDeviceMessage(socket, parsed);
+      await this.enqueueDeviceMessage(socket, parsed);
+    }
+  }
+
+  private async enqueueDeviceMessage(socket: ManagedSocket, parsed: unknown): Promise<void> {
+    const lampId = socket.meta?.lampId;
+    if (!lampId) return;
+    const previous = this.deviceMessageChains.get(lampId) || Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        // A replaced/old socket must never mutate state after a newer device
+        // connection has taken ownership of the lamp ID.
+        if (this.deviceSockets.get(lampId) !== socket || socket.readyState !== WebSocket.OPEN) return;
+        await this.handleDeviceMessage(socket, parsed);
+      });
+    this.deviceMessageChains.set(lampId, next);
+    try {
+      await next;
+    } finally {
+      if (this.deviceMessageChains.get(lampId) === next) this.deviceMessageChains.delete(lampId);
     }
   }
 
@@ -222,7 +278,7 @@ export class WebSocketHub {
           commandId,
           action: body.action,
           value: body.value ?? null,
-          expiresAt: new Date(Date.now() + 5_000).toISOString()
+          expiresAt: new Date(Date.now() + 1_500).toISOString()
         });
         this.send(socket, {
           type: "commandAccepted",
@@ -258,41 +314,48 @@ export class WebSocketHub {
     if (!lampId) return;
     try {
       const type = typeof parsed === "object" && parsed !== null ? (parsed as { type?: string }).type : undefined;
+      const currentDevice = await prisma.device.findUnique({ where: { lampId }, include: { state: true } });
+      if (!currentDevice) return;
+
       if (type === "state") {
         const state = deviceStateSchema.parse(parsed);
-        const device = await prisma.device.update({
-          where: { lampId },
+        if (!shouldAcceptState(currentDevice.state?.rawJson, state as unknown as Record<string, unknown>)) {
+          await prisma.device.update({ where: { id: currentDevice.id }, data: { online: true, lastSeen: new Date() } });
+          return;
+        }
+
+        const persistedState = await prisma.deviceState.upsert({
+          where: { deviceId: currentDevice.id },
+          create: {
+            deviceId: currentDevice.id,
+            power: state.power,
+            brightness: state.brightness,
+            fadeMode: state.fadeMode,
+            timerRemaining: state.timerRemaining,
+            rawJson: state as Prisma.InputJsonValue
+          },
+          update: {
+            power: state.power,
+            brightness: state.brightness,
+            fadeMode: state.fadeMode,
+            timerRemaining: state.timerRemaining,
+            rawJson: state as Prisma.InputJsonValue
+          }
+        });
+        const updatedDevice = await prisma.device.update({
+          where: { id: currentDevice.id },
           data: {
             online: true,
             lastSeen: new Date(),
-            ...(state.firmwareVersion ? { firmwareVersion: state.firmwareVersion } : {}),
-            state: {
-              upsert: {
-                create: {
-                  power: state.power,
-                  brightness: state.brightness,
-                  fadeMode: state.fadeMode,
-                  timerRemaining: state.timerRemaining,
-                  rawJson: state as Prisma.InputJsonValue
-                },
-                update: {
-                  power: state.power,
-                  brightness: state.brightness,
-                  fadeMode: state.fadeMode,
-                  timerRemaining: state.timerRemaining,
-                  rawJson: state as Prisma.InputJsonValue
-                }
-              }
-            }
-          },
-          include: { state: true }
+            ...(state.firmwareVersion ? { firmwareVersion: state.firmwareVersion } : {})
+          }
         });
         await this.broadcastDeviceEvent(lampId, {
           type: "state",
           lampId,
           online: true,
-          firmwareVersion: device.firmwareVersion,
-          state: this.stateForApp(device.state)
+          firmwareVersion: updatedDevice.firmwareVersion,
+          state: this.stateForApp(persistedState)
         });
         return;
       }
@@ -300,14 +363,22 @@ export class WebSocketHub {
       if (type === "ack") {
         const ack = deviceAckSchema.parse(parsed);
         const command = await prisma.deviceCommand.findUnique({ where: { commandId: ack.commandId } });
-        const device = command
-          ? await prisma.device.findUnique({ where: { id: command.deviceId }, include: { state: true } })
-          : await prisma.device.findUnique({ where: { lampId }, include: { state: true } });
-        if (!device) return;
 
-        if (command) {
-          await prisma.deviceCommand.update({
-            where: { id: command.id },
+        // A command ID is globally unique. An ACK from any other authenticated
+        // lamp must not update that command or satisfy the owning app waiter.
+        if (command && command.deviceId !== currentDevice.id) {
+          this.send(socket, {
+            type: "error",
+            code: "WRONG_DEVICE_ACK",
+            message: "commandId belongs to a different lamp"
+          });
+          console.warn(`Rejected wrong-device ACK ${ack.commandId} from ${lampId}`);
+          return;
+        }
+
+        if (command && (command.status === "PENDING" || command.status === "SENT")) {
+          await prisma.deviceCommand.updateMany({
+            where: { id: command.id, status: { in: ["PENDING", "SENT"] } },
             data: {
               status: ack.success ? "ACKNOWLEDGED" : "FAILED",
               acknowledgedAt: new Date(),
@@ -316,8 +387,8 @@ export class WebSocketHub {
           });
         }
 
-        let persistedState = device.state;
-        if (ack.state) {
+        let persistedState = currentDevice.state;
+        if (ack.state && shouldAcceptState(currentDevice.state?.rawJson, ack.state as unknown as Record<string, unknown>)) {
           const stateData = {
             power: ack.state.power,
             brightness: ack.state.brightness,
@@ -326,22 +397,29 @@ export class WebSocketHub {
             rawJson: ack.state as Prisma.InputJsonValue
           };
           persistedState = await prisma.deviceState.upsert({
-            where: { deviceId: device.id },
-            create: { deviceId: device.id, ...stateData },
+            where: { deviceId: currentDevice.id },
+            create: { deviceId: currentDevice.id, ...stateData },
             update: stateData
           });
-          if (ack.state.firmwareVersion) {
-            await prisma.device.update({
-              where: { id: device.id },
-              data: { firmwareVersion: ack.state.firmwareVersion, lastSeen: new Date(), online: true }
-            });
-          }
         }
+
+        await prisma.device.update({
+          where: { id: currentDevice.id },
+          data: {
+            online: true,
+            lastSeen: new Date(),
+            ...(ack.state?.firmwareVersion ? { firmwareVersion: ack.state.firmwareVersion } : {})
+          }
+        });
+
         await this.broadcastDeviceEvent(lampId, {
           type: "ack",
           lampId,
           commandId: ack.commandId,
           success: ack.success,
+          applied: ack.applied,
+          duplicate: ack.duplicate,
+          ignoredReason: ack.ignoredReason,
           error: ack.error,
           ephemeral: !command,
           state: this.stateForApp(persistedState)
@@ -360,10 +438,45 @@ export class WebSocketHub {
   }
 
   async sendCommandToDevice(lampId: string, payload: unknown): Promise<boolean> {
+    let delivered = false;
+    const previous = this.deviceSendChains.get(lampId) || Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        delivered = await this.sendDeviceFrameNow(lampId, payload);
+      });
+    this.deviceSendChains.set(lampId, next);
+    try {
+      await next;
+    } finally {
+      if (this.deviceSendChains.get(lampId) === next) this.deviceSendChains.delete(lampId);
+    }
+    return delivered;
+  }
+
+  private async sendDeviceFrameNow(lampId: string, payload: unknown): Promise<boolean> {
     const socket = this.deviceSockets.get(lampId);
     if (!socket || socket.readyState !== WebSocket.OPEN || !socket.meta?.authenticated) return false;
-    this.send(socket, payload);
-    return true;
+    if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+      console.warn(`Device ${lampId} WebSocket backpressure: ${socket.bufferedAmount} buffered bytes`);
+      return false;
+    }
+    const text = JSON.stringify(payload);
+    return await new Promise<boolean>((resolve) => {
+      try {
+        socket.send(text, (error) => {
+          if (error) {
+            console.warn(`Device ${lampId} WebSocket send failed`, error.message);
+            resolve(false);
+            return;
+          }
+          resolve(true);
+        });
+      } catch (error) {
+        console.warn(`Device ${lampId} WebSocket send threw`, error instanceof Error ? error.message : error);
+        resolve(false);
+      }
+    });
   }
 
   disconnectDevice(lampId: string, code = 1000, reason = "Disconnected"): void {
@@ -400,28 +513,31 @@ export class WebSocketHub {
           { status: "PENDING" },
           {
             status: "SENT",
-            action: { in: ["setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
+            action: { in: ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
           }
         ]
       },
       orderBy: { createdAt: "asc" },
       take: 20
     });
+    let deliveredCount = 0;
     for (const command of pending) {
-      this.send(socket, {
+      const delivered = await this.sendCommandToDevice(lampId, {
         type: "deviceCommand",
         commandId: command.commandId,
         action: command.action,
         value: command.valueJson,
         expiresAt: command.expiresAt.toISOString()
       });
-      await prisma.deviceCommand.update({
-        where: { id: command.id },
-        data: { status: "SENT", deliveredAt: new Date() }
+      if (!delivered) break;
+      deliveredCount += 1;
+      await prisma.deviceCommand.updateMany({
+        where: { id: command.id, status: { in: ["PENDING", "SENT"] } },
+        data: { status: "SENT", deliveredAt: new Date(), errorMessage: null }
       });
     }
-    if (pending.length) {
-      console.log(`Delivered ${pending.length} queued command(s) to ${lampId}`);
+    if (deliveredCount) {
+      console.log(`Delivered ${deliveredCount} queued command(s) to ${lampId}`);
     }
   }
 
@@ -436,6 +552,8 @@ export class WebSocketHub {
     if (socket.meta.lampId && this.deviceSockets.get(socket.meta.lampId) === socket) {
       const lampId = socket.meta.lampId;
       this.deviceSockets.delete(lampId);
+      this.deviceSendChains.delete(lampId);
+      this.deviceMessageChains.delete(lampId);
       await prisma.device.updateMany({
         where: { lampId },
         data: { online: false, lastSeen: new Date() }
@@ -484,7 +602,7 @@ export class WebSocketHub {
         status: "SENT",
         expiresAt: { gt: now },
         deliveredAt: { lte: retryBefore },
-        action: { in: ["setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
+        action: { in: ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
       },
       include: { device: { select: { lampId: true } } },
       orderBy: { deliveredAt: "asc" },
@@ -492,15 +610,14 @@ export class WebSocketHub {
     });
 
     for (const command of retryable) {
-      const socket = this.deviceSockets.get(command.device.lampId);
-      if (!socket || socket.readyState !== WebSocket.OPEN || !socket.meta?.authenticated) continue;
-      this.send(socket, {
+      const delivered = await this.sendCommandToDevice(command.device.lampId, {
         type: "deviceCommand",
         commandId: command.commandId,
         action: command.action,
         value: command.valueJson,
         expiresAt: command.expiresAt.toISOString()
       });
+      if (!delivered) continue;
       await prisma.deviceCommand.updateMany({
         where: { id: command.id, status: "SENT" },
         data: { deliveredAt: new Date(), errorMessage: null }
@@ -541,6 +658,7 @@ export class WebSocketHub {
     return {
       power: state.power,
       brightness: state.brightness,
+      rememberedBrightness: pick("rememberedBrightness") ?? pick("lastBrightness"),
       fadeMode: state.fadeMode,
       timerRemaining: state.timerRemaining,
       updatedAt: state.updatedAt,
@@ -565,6 +683,17 @@ export class WebSocketHub {
   }
 
   private send(socket: WebSocket, payload: unknown): void {
-    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+      console.warn(`WebSocket backpressure: ${socket.bufferedAmount} buffered bytes; dropping non-command frame`);
+      return;
+    }
+    try {
+      socket.send(JSON.stringify(payload), (error) => {
+        if (error) console.warn("WebSocket send failed", error.message);
+      });
+    } catch (error) {
+      console.warn("WebSocket send threw", error instanceof Error ? error.message : error);
+    }
   }
 }

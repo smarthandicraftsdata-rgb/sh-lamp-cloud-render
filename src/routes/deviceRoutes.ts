@@ -208,6 +208,31 @@ export function createDeviceRouter(hub: WebSocketHub): Router {
     })
   );
 
+  router.get(
+    "/api/devices/:lampId/commands/:commandId",
+    asyncRoute(async (req: AuthenticatedRequest, res) => {
+      const userId = getUserId(req);
+      const lampId = lampIdParam.parse(req.params.lampId);
+      const commandId = z.string().min(8).max(100).parse(req.params.commandId);
+      const device = await findAccessibleDevice(userId, lampId);
+      const command = await prisma.deviceCommand.findFirst({
+        where: { commandId, deviceId: device.id }
+      });
+      if (!command) throw new AppError(404, "COMMAND_NOT_FOUND", "Command was not found for this lamp");
+      res.json({
+        ok: true,
+        lampId,
+        commandId: command.commandId,
+        status: command.status,
+        expiresAt: command.expiresAt,
+        deliveredAt: command.deliveredAt,
+        acknowledgedAt: command.acknowledgedAt,
+        errorMessage: command.errorMessage,
+        error: command.errorMessage
+      });
+    })
+  );
+
   router.delete(
     "/api/devices/:lampId",
     asyncRoute(async (req: AuthenticatedRequest, res) => {
