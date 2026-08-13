@@ -665,7 +665,7 @@ export class WebSocketHub {
     });
 
     if (ack.state) {
-      this.queueLatestDeviceState(deviceId, lampId, socket.meta!.generation!, ack.state);
+      this.queueLatestDeviceState(deviceId, lampId, socket.meta!.generation!, { type: "state", ...ack.state });
     } else {
       void prisma.device.updateMany({
         where: { id: deviceId },
