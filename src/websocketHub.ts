@@ -11,12 +11,31 @@ interface SocketMeta {
   authenticated: boolean;
   userId?: string;
   lampId?: string;
+  deviceId?: string;
+  generation?: number;
   alive: boolean;
   authTimer: NodeJS.Timeout;
-  accessibleLampIds?: Set<string>;
+  accessibleLampIds?: Map<string, { deviceId: string; checkedAt: number }>;
 }
 
 type ManagedSocket = WebSocket & { meta?: SocketMeta };
+type DeviceTarget = { socket: ManagedSocket; generation: number };
+type LiveFrameSlot = DeviceTarget & { payload: unknown; commandId: string };
+type PersistedStateSlot = {
+  deviceId: string;
+  lampId: string;
+  generation: number;
+  state: z.infer<typeof deviceStateSchema>;
+};
+type CommandContext = {
+  commandDbId: string;
+  commandId: string;
+  deviceId: string;
+  lampId: string;
+  userId: string;
+  expiresAt: number;
+  registeredAt: number;
+};
 
 const appAuthSchema = z.object({ type: z.literal("auth"), token: z.string().min(20) });
 const deviceAuthSchema = z.object({
@@ -68,9 +87,11 @@ const deviceAckSchema = z.object({
   state: deviceStateSchema.omit({ type: true }).optional()
 });
 
-const latestWinsActions = ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer"];
+const latestWinsActions = ["toggle", "setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer"];
 const STALE_CONTROL_AGE_MS = 2_000;
 const MAX_SOCKET_BUFFERED_BYTES = 256 * 1024;
+const DEVICE_SEND_CALLBACK_BUDGET_MS = 300;
+const APP_ACCESS_CACHE_TTL_MS = 10_000;
 
 function objectValue(value: Prisma.JsonValue | null | undefined): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -106,8 +127,24 @@ export class WebSocketHub {
   private readonly deviceServer = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 });
   private readonly appSockets = new Map<string, Set<ManagedSocket>>();
   private readonly deviceSockets = new Map<string, ManagedSocket>();
-  private readonly deviceSendChains = new Map<string, Promise<void>>();
+  private readonly deviceGenerationCounters = new Map<string, number>();
+  // Durable sends and incoming device messages are serialized per socket
+  // generation. An old generation can never hold or redirect work for a new
+  // authenticated socket.
   private readonly deviceMessageChains = new Map<string, Promise<void>>();
+  // RF5.4.1: network ACK delivery is decoupled from secondary Prisma writes.
+  // Device state persistence is one in-flight snapshot + one replaceable latest
+  // slot per physical lamp. A DB slowdown therefore cannot build an unbounded
+  // state queue behind the realtime command path.
+  private readonly pendingStatePersistence = new Map<string, PersistedStateSlot>();
+  private readonly statePersistenceRunning = new Set<string>();
+  private readonly commandContexts = new Map<string, CommandContext>();
+  private static readonly MAX_COMMAND_CONTEXTS = 2048;
+  // Live slider traffic has exactly one in-flight frame plus one replaceable
+  // pending slot per lamp. It cannot build an unbounded queue behind durable
+  // controls.
+  private readonly liveFrameSlots = new Map<string, LiveFrameSlot>();
+  private readonly liveDrainRunning = new Set<string>();
   // RF5.3: remember short-lived slider command IDs so ACKs from older RF5
   // firmware can be discarded without Prisma writes. New RF5.3 firmware does
   // not ACK ephemeral frames at all, but this keeps a mixed deployment safe.
@@ -182,21 +219,25 @@ export class WebSocketHub {
 
   private async enqueueDeviceMessage(socket: ManagedSocket, parsed: unknown): Promise<void> {
     const lampId = socket.meta?.lampId;
-    if (!lampId) return;
-    const previous = this.deviceMessageChains.get(lampId) || Promise.resolve();
+    const generation = socket.meta?.generation;
+    if (!lampId || generation === undefined) return;
+    const lane = this.deviceLaneKey(lampId, generation);
+    const previous = this.deviceMessageChains.get(lane) || Promise.resolve();
     const next = previous
       .catch(() => undefined)
       .then(async () => {
         // A replaced/old socket must never mutate state after a newer device
         // connection has taken ownership of the lamp ID.
-        if (this.deviceSockets.get(lampId) !== socket || socket.readyState !== WebSocket.OPEN) return;
+        if (this.deviceSockets.get(lampId) !== socket ||
+            socket.meta?.generation !== generation ||
+            socket.readyState !== WebSocket.OPEN) return;
         await this.handleDeviceMessage(socket, parsed);
       });
-    this.deviceMessageChains.set(lampId, next);
+    this.deviceMessageChains.set(lane, next);
     try {
       await next;
     } finally {
-      if (this.deviceMessageChains.get(lampId) === next) this.deviceMessageChains.delete(lampId);
+      if (this.deviceMessageChains.get(lane) === next) this.deviceMessageChains.delete(lane);
     }
   }
 
@@ -220,7 +261,11 @@ export class WebSocketHub {
         // RF5.3: authorization for the lamps visible at authentication time is
         // cached on this authenticated socket. Slider liveCommand frames no
         // longer perform one Prisma authorization query per finger movement.
-        socket.meta.accessibleLampIds = new Set(devices.map((device) => normalizeLampId(device.lampId)));
+        const checkedAt = Date.now();
+        socket.meta.accessibleLampIds = new Map(devices.map((device) => [
+          normalizeLampId(device.lampId),
+          { deviceId: device.id, checkedAt }
+        ]));
         this.send(socket, {
           type: "authOk",
           connection: "app",
@@ -240,10 +285,15 @@ export class WebSocketHub {
         }
 
         this.disconnectDevice(lampId, 4002, "Replaced by a newer connection");
+        const generation = (this.deviceGenerationCounters.get(lampId) || 0) + 1;
+        this.deviceGenerationCounters.set(lampId, generation);
         socket.meta.authenticated = true;
         socket.meta.lampId = lampId;
+        socket.meta.deviceId = device.id;
+        socket.meta.generation = generation;
         clearTimeout(socket.meta.authTimer);
         this.deviceSockets.set(lampId, socket);
+        console.log(`RF5.4.1 CLOUD device_auth lamp=${lampId} generation=${generation}`);
         await prisma.device.update({
           where: { id: device.id },
           data: { online: true, lastSeen: new Date() }
@@ -258,6 +308,29 @@ export class WebSocketHub {
     }
   }
 
+  private async ensureAppAccess(socket: ManagedSocket, lampId: string): Promise<string | undefined> {
+    const userId = socket.meta?.userId;
+    if (!userId) return undefined;
+    const now = Date.now();
+    const cached = socket.meta?.accessibleLampIds?.get(lampId);
+    if (cached && now - cached.checkedAt <= APP_ACCESS_CACHE_TTL_MS) return cached.deviceId;
+
+    const device = await prisma.device.findFirst({
+      where: {
+        lampId,
+        OR: [{ ownerId: userId }, { home: { members: { some: { userId } } } }]
+      },
+      select: { id: true }
+    });
+    if (!device) {
+      socket.meta?.accessibleLampIds?.delete(lampId);
+      return undefined;
+    }
+    if (!socket.meta!.accessibleLampIds) socket.meta!.accessibleLampIds = new Map();
+    socket.meta!.accessibleLampIds!.set(lampId, { deviceId: device.id, checkedAt: now });
+    return device.id;
+  }
+
   private async handleAppMessage(socket: ManagedSocket, parsed: unknown): Promise<void> {
     try {
       const body = appCommandSchema.parse(parsed);
@@ -266,48 +339,37 @@ export class WebSocketHub {
         return;
       }
       const lampId = normalizeLampId(body.lampId);
-      let deviceId: string | undefined;
-      const accessCache = socket.meta!.accessibleLampIds;
-      if (!accessCache?.has(lampId)) {
-        // A lamp may be claimed or shared after this WebSocket authenticated.
-        // Misses are revalidated against Prisma once, then added to the socket
-        // cache; known lamps take the zero-query fast path.
-        const device = await prisma.device.findFirst({
-          where: {
-            lampId,
-            OR: [{ ownerId: socket.meta!.userId }, { home: { members: { some: { userId: socket.meta!.userId } } } }]
-          },
-          select: { id: true }
-        });
-        if (!device) {
-          this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
-          return;
-        }
-        deviceId = device.id;
-        if (accessCache) accessCache.add(lampId);
-        else socket.meta!.accessibleLampIds = new Set([lampId]);
+      const deviceId = await this.ensureAppAccess(socket, lampId);
+      if (!deviceId) {
+        this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
+        return;
       }
 
       if (body.type === "liveCommand") {
-        // Slider drag traffic is intentionally ephemeral: it is forwarded over
-        // the already-open device WebSocket without creating a DB row for every
-        // intermediate value. The app still sends one durable final `command`
-        // when the drag finishes.
+        // Slider drag traffic is intentionally ephemeral. It gets one in-flight
+        // frame and one replaceable latest slot per lamp, never a FIFO backlog.
         const commandId = body.commandId || randomCommandId();
         const now = Date.now();
-        if (this.ephemeralCommands.size > 1024) {
+        if (this.ephemeralCommands.size >= 1024) {
           for (const [id, item] of this.ephemeralCommands) {
             if (item.expiresAt <= now) this.ephemeralCommands.delete(id);
           }
+          while (this.ephemeralCommands.size >= 1024) {
+            const oldest = this.ephemeralCommands.keys().next().value as string | undefined;
+            if (!oldest) break;
+            this.ephemeralCommands.delete(oldest);
+          }
         }
         this.ephemeralCommands.set(commandId, { lampId, expiresAt: now + 5_000 });
-        const delivered = await this.sendCommandToDevice(lampId, {
+        const expiresAt = now + 1_500;
+        const delivered = await this.queueLiveCommandToDevice(lampId, commandId, {
           type: "deviceCommand",
           commandId,
           action: body.action,
           value: body.value ?? null,
           ephemeral: true,
-          expiresAt: new Date(now + 1_500).toISOString()
+          expiresAt: new Date(expiresAt).toISOString(),
+          expiresAtEpochSec: Math.floor(expiresAt / 1000)
         });
         if (!delivered) this.ephemeralCommands.delete(commandId);
         this.send(socket, {
@@ -320,22 +382,10 @@ export class WebSocketHub {
         return;
       }
 
-      if (!deviceId) {
-        const durableDevice = await prisma.device.findUnique({ where: { lampId }, select: { id: true } });
-        if (!durableDevice) {
-          this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
-          return;
-        }
-        deviceId = durableDevice.id;
-      }
-      const resolvedDeviceId = deviceId;
-      if (!resolvedDeviceId) {
-        this.send(socket, { type: "error", code: "DEVICE_NOT_FOUND", message: "Lamp is not accessible" });
-        return;
-      }
+      console.log(`RF5.4.1 CMD app_rx id=${body.commandId || "server"} lamp=${lampId} action=${body.action}`);
       const result = await createAndDispatchCommand({
         hub: this,
-        deviceId: resolvedDeviceId,
+        deviceId,
         lampId,
         userId: socket.meta!.userId!,
         action: body.action,
@@ -354,148 +404,27 @@ export class WebSocketHub {
 
   private async handleDeviceMessage(socket: ManagedSocket, parsed: unknown): Promise<void> {
     const lampId = socket.meta?.lampId;
-    if (!lampId) return;
+    const deviceId = socket.meta?.deviceId;
+    const generation = socket.meta?.generation;
+    if (!lampId || !deviceId || generation === undefined) return;
     try {
       const type = typeof parsed === "object" && parsed !== null ? (parsed as { type?: string }).type : undefined;
-      const currentDevice = await prisma.device.findUnique({ where: { lampId }, include: { state: true } });
-      if (!currentDevice) return;
 
       if (type === "state") {
         const state = deviceStateSchema.parse(parsed);
         const suppressUntil = this.ephemeralStateSuppressUntil.get(lampId) || 0;
-        if (suppressUntil > Date.now()) {
-          // Old RF5 firmware sends a full state immediately after each live
-          // slider ACK. The final durable command/ACK persists authoritative
-          // state, so suppress this redundant write/broadcast burst.
-          return;
-        }
+        if (suppressUntil > Date.now()) return;
         if (suppressUntil) this.ephemeralStateSuppressUntil.delete(lampId);
-        if (!shouldAcceptState(currentDevice.state?.rawJson, state as unknown as Record<string, unknown>)) {
-          await prisma.device.update({ where: { id: currentDevice.id }, data: { online: true, lastSeen: new Date() } });
-          return;
-        }
 
-        const persistedState = await prisma.deviceState.upsert({
-          where: { deviceId: currentDevice.id },
-          create: {
-            deviceId: currentDevice.id,
-            power: state.power,
-            brightness: state.brightness,
-            fadeMode: state.fadeMode,
-            timerRemaining: state.timerRemaining,
-            rawJson: state as Prisma.InputJsonValue
-          },
-          update: {
-            power: state.power,
-            brightness: state.brightness,
-            fadeMode: state.fadeMode,
-            timerRemaining: state.timerRemaining,
-            rawJson: state as Prisma.InputJsonValue
-          }
-        });
-        const updatedDevice = await prisma.device.update({
-          where: { id: currentDevice.id },
-          data: {
-            online: true,
-            lastSeen: new Date(),
-            ...(state.firmwareVersion ? { firmwareVersion: state.firmwareVersion } : {})
-          }
-        });
-        await this.broadcastDeviceEvent(lampId, {
-          type: "state",
-          lampId,
-          online: true,
-          firmwareVersion: updatedDevice.firmwareVersion,
-          state: this.stateForApp(persistedState)
-        });
+        // Do not make the socket receive lane wait for PostgreSQL. State writes
+        // remain ordered on a separate per-lamp persistence lane.
+        this.queueLatestDeviceState(deviceId, lampId, generation, state);
         return;
       }
 
       if (type === "ack") {
         const ack = deviceAckSchema.parse(parsed);
-        const command = await prisma.deviceCommand.findUnique({ where: { commandId: ack.commandId } });
-        const ephemeral = command ? undefined : this.ephemeralCommands.get(ack.commandId);
-
-        // A command ID is globally unique. An ACK from any other authenticated
-        // lamp must not update that command or satisfy the owning app waiter.
-        if (command && command.deviceId !== currentDevice.id) {
-          this.send(socket, {
-            type: "error",
-            code: "WRONG_DEVICE_ACK",
-            message: "commandId belongs to a different lamp"
-          });
-          console.warn(`Rejected wrong-device ACK ${ack.commandId} from ${lampId}`);
-          return;
-        }
-
-        if (ephemeral && ephemeral.lampId !== lampId) {
-          this.ephemeralCommands.delete(ack.commandId);
-          this.send(socket, {
-            type: "error",
-            code: "WRONG_DEVICE_EPHEMERAL_ACK",
-            message: "ephemeral commandId belongs to a different lamp"
-          });
-          return;
-        }
-
-        if (ephemeral) {
-          // RF5.3 mixed-deployment protection: RF5/RF5.1 devices ACK every
-          // slider frame with a full state snapshot. Do not turn that into two
-          // Prisma writes + account broadcasts per frame. The final released
-          // value is still a durable command and persists authoritative state.
-          this.ephemeralCommands.delete(ack.commandId);
-          this.ephemeralStateSuppressUntil.set(lampId, Date.now() + 350);
-          return;
-        }
-
-        if (command && (command.status === "PENDING" || command.status === "SENT")) {
-          await prisma.deviceCommand.updateMany({
-            where: { id: command.id, status: { in: ["PENDING", "SENT"] } },
-            data: {
-              status: ack.success ? "ACKNOWLEDGED" : "FAILED",
-              acknowledgedAt: new Date(),
-              errorMessage: ack.success ? null : ack.error || "Device rejected command"
-            }
-          });
-        }
-
-        let persistedState = currentDevice.state;
-        if (ack.state && shouldAcceptState(currentDevice.state?.rawJson, ack.state as unknown as Record<string, unknown>)) {
-          const stateData = {
-            power: ack.state.power,
-            brightness: ack.state.brightness,
-            fadeMode: ack.state.fadeMode,
-            timerRemaining: ack.state.timerRemaining,
-            rawJson: ack.state as Prisma.InputJsonValue
-          };
-          persistedState = await prisma.deviceState.upsert({
-            where: { deviceId: currentDevice.id },
-            create: { deviceId: currentDevice.id, ...stateData },
-            update: stateData
-          });
-        }
-
-        await prisma.device.update({
-          where: { id: currentDevice.id },
-          data: {
-            online: true,
-            lastSeen: new Date(),
-            ...(ack.state?.firmwareVersion ? { firmwareVersion: ack.state.firmwareVersion } : {})
-          }
-        });
-
-        await this.broadcastDeviceEvent(lampId, {
-          type: "ack",
-          lampId,
-          commandId: ack.commandId,
-          success: ack.success,
-          applied: ack.applied,
-          duplicate: ack.duplicate,
-          ignoredReason: ack.ignoredReason,
-          error: ack.error,
-          ephemeral: !command,
-          state: this.stateForApp(persistedState)
-        });
+        await this.handleDeviceAckFast(socket, lampId, deviceId, ack);
         return;
       }
 
@@ -509,44 +438,352 @@ export class WebSocketHub {
     }
   }
 
-  async sendCommandToDevice(lampId: string, payload: unknown): Promise<boolean> {
-    let delivered = false;
-    const previous = this.deviceSendChains.get(lampId) || Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        delivered = await this.sendDeviceFrameNow(lampId, payload);
-      });
-    this.deviceSendChains.set(lampId, next);
-    try {
-      await next;
-    } finally {
-      if (this.deviceSendChains.get(lampId) === next) this.deviceSendChains.delete(lampId);
+  /**
+   * Register the durable command immediately before dispatch. This bounded
+   * in-memory index lets a normal device ACK be validated and delivered to the
+   * issuing user's /ws/app socket without a command lookup or state persistence
+   * round-trip first. The database row already exists before this is called.
+   */
+  registerCommandContext(context: Omit<CommandContext, "registeredAt">): void {
+    const now = Date.now();
+    this.pruneCommandContexts(now);
+    while (this.commandContexts.size >= WebSocketHub.MAX_COMMAND_CONTEXTS) {
+      const oldest = this.commandContexts.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.commandContexts.delete(oldest);
     }
-    return delivered;
+    this.commandContexts.set(context.commandId, { ...context, registeredAt: now });
   }
 
-  private async sendDeviceFrameNow(lampId: string, payload: unknown): Promise<boolean> {
+  private pruneCommandContexts(now = Date.now()): void {
+    for (const [commandId, context] of this.commandContexts) {
+      if (context.expiresAt + 30_000 < now || context.registeredAt + 120_000 < now) {
+        this.commandContexts.delete(commandId);
+      }
+    }
+  }
+
+  private sendToUser(userId: string, payload: unknown): void {
+    for (const appSocket of this.appSockets.get(userId) || []) this.send(appSocket, payload);
+  }
+
+  private queueLatestDeviceState(
+    deviceId: string,
+    lampId: string,
+    generation: number,
+    state: z.infer<typeof deviceStateSchema>
+  ): void {
+    // Replace any not-yet-started state snapshot. The ESP stateRevision/boot
+    // epoch still guards the actual DB write, so dropping an obsolete middle
+    // snapshot cannot change the final authoritative lamp state.
+    this.pendingStatePersistence.set(lampId, { deviceId, lampId, generation, state });
+    if (this.statePersistenceRunning.has(lampId)) return;
+    this.statePersistenceRunning.add(lampId);
+    void this.drainLatestDeviceState(lampId);
+  }
+
+  private async drainLatestDeviceState(lampId: string): Promise<void> {
+    try {
+      while (true) {
+        const slot = this.pendingStatePersistence.get(lampId);
+        if (!slot) return;
+        this.pendingStatePersistence.delete(lampId);
+        try {
+          await this.persistDeviceState(slot.deviceId, slot.lampId, slot.generation, slot.state);
+        } catch (error) {
+          console.error(`RF5.4.1 state persistence failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+        }
+      }
+    } finally {
+      this.statePersistenceRunning.delete(lampId);
+      if (this.pendingStatePersistence.has(lampId) && !this.statePersistenceRunning.has(lampId)) {
+        this.statePersistenceRunning.add(lampId);
+        void this.drainLatestDeviceState(lampId);
+      }
+    }
+  }
+
+  private async persistDeviceState(
+    deviceId: string,
+    lampId: string,
+    generation: number,
+    state: z.infer<typeof deviceStateSchema>
+  ): Promise<void> {
+    // If a newer authenticated device generation has already replaced this
+    // message's socket, the old generation is no longer allowed to mutate
+    // persisted/current state. This closes the async DB-after-replacement race.
+    const currentSocketBeforeDB = this.deviceSockets.get(lampId);
+    if (currentSocketBeforeDB && currentSocketBeforeDB.meta?.generation !== generation) return;
+
+    const currentDevice = await prisma.device.findUnique({ where: { id: deviceId }, include: { state: true } });
+    if (!currentDevice || normalizeLampId(currentDevice.lampId) !== lampId) return;
+    const currentSocket = this.deviceSockets.get(lampId);
+    if (currentSocket && currentSocket.meta?.generation !== generation) return;
+    const generationStillCurrent = currentSocket?.meta?.generation === generation &&
+      currentSocket.readyState === WebSocket.OPEN && currentSocket.meta?.authenticated === true;
+    if (!shouldAcceptState(currentDevice.state?.rawJson, state as unknown as Record<string, unknown>)) {
+      await prisma.device.updateMany({
+        where: { id: deviceId },
+        data: { lastSeen: new Date(), ...(generationStillCurrent ? { online: true } : {}) }
+      });
+      return;
+    }
+
+    const persistedState = await prisma.deviceState.upsert({
+      where: { deviceId },
+      create: {
+        deviceId,
+        power: state.power,
+        brightness: state.brightness,
+        fadeMode: state.fadeMode,
+        timerRemaining: state.timerRemaining,
+        rawJson: state as Prisma.InputJsonValue
+      },
+      update: {
+        power: state.power,
+        brightness: state.brightness,
+        fadeMode: state.fadeMode,
+        timerRemaining: state.timerRemaining,
+        rawJson: state as Prisma.InputJsonValue
+      }
+    });
+    const updatedDevice = await prisma.device.update({
+      where: { id: deviceId },
+      data: {
+        lastSeen: new Date(),
+        ...(generationStillCurrent ? { online: true } : {}),
+        ...(state.firmwareVersion ? { firmwareVersion: state.firmwareVersion } : {})
+      }
+    });
+    await this.broadcastDeviceEvent(lampId, {
+      type: "state",
+      lampId,
+      online: generationStillCurrent,
+      firmwareVersion: updatedDevice.firmwareVersion,
+      state: this.stateForApp(persistedState)
+    });
+  }
+
+  private async handleDeviceAckFast(
+    socket: ManagedSocket,
+    lampId: string,
+    deviceId: string,
+    ack: z.infer<typeof deviceAckSchema>
+  ): Promise<void> {
+    const receivedAt = Date.now();
+    const ephemeral = this.ephemeralCommands.get(ack.commandId);
+    if (ephemeral) {
+      if (ephemeral.lampId !== lampId) {
+        this.ephemeralCommands.delete(ack.commandId);
+        this.send(socket, {
+          type: "error",
+          code: "WRONG_DEVICE_EPHEMERAL_ACK",
+          message: "ephemeral commandId belongs to a different lamp"
+        });
+        return;
+      }
+      this.ephemeralCommands.delete(ack.commandId);
+      this.ephemeralStateSuppressUntil.set(lampId, receivedAt + 350);
+      return;
+    }
+
+    let context = this.commandContexts.get(ack.commandId);
+    let fallbackCommand: {
+      id: string; commandId: string; deviceId: string; userId: string | null; expiresAt: Date; createdAt: Date;
+    } | null = null;
+    if (!context) {
+      // Render restart / old pending command fallback. Normal RF5.4.1 traffic
+      // uses the in-memory context and performs zero Prisma reads before ACK.
+      fallbackCommand = await prisma.deviceCommand.findUnique({
+        where: { commandId: ack.commandId },
+        select: { id: true, commandId: true, deviceId: true, userId: true, expiresAt: true, createdAt: true }
+      });
+      if (fallbackCommand) {
+        context = {
+          commandDbId: fallbackCommand.id,
+          commandId: fallbackCommand.commandId,
+          deviceId: fallbackCommand.deviceId,
+          lampId,
+          userId: fallbackCommand.userId || "",
+          expiresAt: fallbackCommand.expiresAt.getTime(),
+          registeredAt: fallbackCommand.createdAt.getTime()
+        };
+      }
+    }
+
+    // The fallback lookup above may have yielded the Node event loop. Confirm
+    // this is still the authoritative socket generation before forwarding.
+    if (this.deviceSockets.get(lampId) !== socket || socket.meta?.generation === undefined ||
+        this.deviceSockets.get(lampId)?.meta?.generation !== socket.meta.generation) return;
+
+    if (!context) {
+      // Unknown ACK: never broadcast it to arbitrary users. It may be from an
+      // already-pruned duplicate after a very old reconnect.
+      console.warn(`RF5.4.1 unknown ACK id=${ack.commandId} lamp=${lampId}`);
+      return;
+    }
+    if (context.deviceId !== deviceId || context.lampId !== lampId) {
+      this.send(socket, { type: "error", code: "WRONG_DEVICE_ACK", message: "commandId belongs to a different lamp" });
+      console.warn(`Rejected wrong-device ACK ${ack.commandId} from ${lampId}`);
+      return;
+    }
+
+    const fastPayload = {
+      type: "ack",
+      lampId,
+      commandId: ack.commandId,
+      success: ack.success,
+      applied: ack.applied,
+      duplicate: ack.duplicate,
+      ignoredReason: ack.ignoredReason,
+      error: ack.error,
+      ephemeral: false,
+      state: ack.state
+    };
+    if (context.userId) this.sendToUser(context.userId, fastPayload);
+    console.log(`RF5.4.1 CMD ack_forward id=${ack.commandId} lamp=${lampId} generation=${socket.meta?.generation ?? -1} db_wait=0ms rx_to_app=${Date.now() - receivedAt}ms success=${ack.success} duplicate=${ack.duplicate ?? false}`);
+
+    // The issuing app is already complete. Persist command status immediately
+    // and independently so a simultaneous REST hedge can observe ACKNOWLEDGED
+    // even if state persistence is slow. State itself goes through the bounded
+    // latest-only slot above.
+    const capturedContext = context;
+    const statusPersistStartedAt = Date.now();
+    void prisma.deviceCommand.updateMany({
+      where: { id: capturedContext.commandDbId, status: { in: ["PENDING", "SENT"] } },
+      data: {
+        status: ack.success ? "ACKNOWLEDGED" : "FAILED",
+        acknowledgedAt: new Date(),
+        errorMessage: ack.success ? null : ack.error || "Device rejected command"
+      }
+    }).then(() => {
+      console.log(`RF5.4.1 CMD ack_status_persist id=${ack.commandId} lamp=${lampId} db_total=${Date.now() - statusPersistStartedAt}ms`);
+    }).catch((error) => {
+      console.error(`RF5.4.1 command ACK persistence failed id=${ack.commandId} lamp=${lampId}`, error instanceof Error ? error.message : error);
+    }).finally(() => {
+      if (this.commandContexts.get(ack.commandId) === capturedContext) this.commandContexts.delete(ack.commandId);
+    });
+
+    if (ack.state) {
+      this.queueLatestDeviceState(deviceId, lampId, socket.meta!.generation!, ack.state);
+    } else {
+      void prisma.device.updateMany({
+        where: { id: deviceId },
+        data: { online: true, lastSeen: new Date() }
+      }).catch((error) => {
+        console.error(`RF5.4.1 device touch failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+      });
+    }
+
+  }
+
+  private deviceLaneKey(lampId: string, generation: number): string {
+    return `${lampId}#${generation}`;
+  }
+
+  private currentDeviceTarget(lampId: string): DeviceTarget | undefined {
     const socket = this.deviceSockets.get(lampId);
-    if (!socket || socket.readyState !== WebSocket.OPEN || !socket.meta?.authenticated) return false;
+    const generation = socket?.meta?.generation;
+    if (!socket || generation === undefined || socket.readyState !== WebSocket.OPEN || !socket.meta?.authenticated) return undefined;
+    return { socket, generation };
+  }
+
+  async sendCommandToDevice(lampId: string, payload: unknown): Promise<boolean> {
+    const target = this.currentDeviceTarget(lampId);
+    if (!target) return false;
+    return await this.sendCommandToBoundTarget(lampId, target, payload);
+  }
+
+  private async sendCommandToBoundTarget(lampId: string, target: DeviceTarget, payload: unknown): Promise<boolean> {
+    // RF5.4 deliberately has no durable per-lamp send promise chain here.
+    // WebSocket.send() calls are issued immediately on the Node event loop; ws
+    // preserves frame order for a socket, while each callback has its own
+    // bounded health budget. A sick send callback therefore cannot freeze newer
+    // commands behind it. Generation binding still prevents zombie-socket use.
+    return await this.sendDeviceFrameNow(lampId, target.socket, target.generation, payload);
+  }
+
+  private async queueLiveCommandToDevice(lampId: string, commandId: string, payload: unknown): Promise<boolean> {
+    const target = this.currentDeviceTarget(lampId);
+    if (!target) return false;
+
+    const replaced = this.liveFrameSlots.get(lampId);
+    if (replaced) this.ephemeralCommands.delete(replaced.commandId);
+    this.liveFrameSlots.set(lampId, { ...target, payload, commandId });
+    if (!this.liveDrainRunning.has(lampId)) {
+      this.liveDrainRunning.add(lampId);
+      void this.drainLiveFrames(lampId);
+    }
+    return true;
+  }
+
+  private async drainLiveFrames(lampId: string): Promise<void> {
+    try {
+      while (true) {
+        const slot = this.liveFrameSlots.get(lampId);
+        if (!slot) return;
+        this.liveFrameSlots.delete(lampId);
+        const delivered = await this.sendDeviceFrameNow(lampId, slot.socket, slot.generation, slot.payload);
+        if (!delivered) this.ephemeralCommands.delete(slot.commandId);
+      }
+    } finally {
+      this.liveDrainRunning.delete(lampId);
+      // A slot cannot normally appear between the final map read and this
+      // synchronous finally block, but keep this restart guard for clarity.
+      if (this.liveFrameSlots.has(lampId) && !this.liveDrainRunning.has(lampId)) {
+        this.liveDrainRunning.add(lampId);
+        void this.drainLiveFrames(lampId);
+      }
+    }
+  }
+
+  private async sendDeviceFrameNow(
+    lampId: string,
+    socket: ManagedSocket,
+    generation: number,
+    payload: unknown
+  ): Promise<boolean> {
+    if (this.deviceSockets.get(lampId) !== socket ||
+        socket.meta?.generation !== generation ||
+        socket.readyState !== WebSocket.OPEN ||
+        !socket.meta?.authenticated) return false;
     if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
-      console.warn(`Device ${lampId} WebSocket backpressure: ${socket.bufferedAmount} buffered bytes`);
+      console.warn(`Device ${lampId} generation ${generation} WebSocket backpressure: ${socket.bufferedAmount} buffered bytes`);
       return false;
     }
     const text = JSON.stringify(payload);
+    const info = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+    const commandId = typeof info.commandId === "string" ? info.commandId : "-";
+    const action = typeof info.action === "string" ? info.action : "-";
+    const startedAt = Date.now();
+
     return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        console.warn(`RF5.4.1 CMD device_send_timeout id=${commandId} lamp=${lampId} action=${action} generation=${generation} buffered=${socket.bufferedAmount}`);
+        finish(false);
+      }, DEVICE_SEND_CALLBACK_BUDGET_MS);
       try {
         socket.send(text, (error) => {
           if (error) {
-            console.warn(`Device ${lampId} WebSocket send failed`, error.message);
-            resolve(false);
+            console.warn(`Device ${lampId} generation ${generation} WebSocket send failed`, error.message);
+            finish(false);
             return;
           }
-          resolve(true);
+          if (commandId !== "-") {
+            console.log(`RF5.4.1 CMD device_send id=${commandId} lamp=${lampId} action=${action} generation=${generation} accepted=${Date.now() - startedAt}ms bytes=${Buffer.byteLength(text)}`);
+          }
+          finish(true);
         });
       } catch (error) {
-        console.warn(`Device ${lampId} WebSocket send threw`, error instanceof Error ? error.message : error);
-        resolve(false);
+        console.warn(`Device ${lampId} generation ${generation} WebSocket send threw`, error instanceof Error ? error.message : error);
+        finish(false);
       }
     });
   }
@@ -560,9 +797,12 @@ export class WebSocketHub {
   }
 
   private async flushPendingCommands(lampId: string, deviceId: string, socket: ManagedSocket): Promise<void> {
+    const generation = socket.meta?.generation;
+    if (generation === undefined) return;
+    const target: DeviceTarget = { socket, generation };
     const now = new Date();
     const staleControlBefore = new Date(now.getTime() - STALE_CONTROL_AGE_MS);
-    // RF2 migration guard: older deployments could leave 120-second absolute
+    // RF2 migration guard: older deployments could leave long-lived absolute
     // controls queued. Never execute those after a route handover.
     await prisma.deviceCommand.updateMany({
       where: {
@@ -571,7 +811,7 @@ export class WebSocketHub {
         action: { in: latestWinsActions },
         createdAt: { lte: staleControlBefore }
       },
-      data: { status: "EXPIRED", errorMessage: "Stale control command expired during RF2 handover protection" }
+      data: { status: "EXPIRED", errorMessage: "Stale control command expired during handover protection" }
     });
     await prisma.deviceCommand.updateMany({
       where: { deviceId, status: { in: ["PENDING", "SENT"] }, expiresAt: { lte: now } },
@@ -583,10 +823,7 @@ export class WebSocketHub {
         expiresAt: { gt: now },
         OR: [
           { status: "PENDING" },
-          {
-            status: "SENT",
-            action: { in: ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
-          }
+          { status: "SENT", action: { in: ["toggle", "setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] } }
         ]
       },
       orderBy: { createdAt: "asc" },
@@ -594,12 +831,14 @@ export class WebSocketHub {
     });
     let deliveredCount = 0;
     for (const command of pending) {
-      const delivered = await this.sendCommandToDevice(lampId, {
+      if (this.deviceSockets.get(lampId) !== socket || socket.meta?.generation !== generation) break;
+      const delivered = await this.sendCommandToBoundTarget(lampId, target, {
         type: "deviceCommand",
         commandId: command.commandId,
         action: command.action,
         value: command.valueJson,
-        expiresAt: command.expiresAt.toISOString()
+        expiresAt: command.expiresAt.toISOString(),
+        expiresAtEpochSec: Math.floor(command.expiresAt.getTime() / 1000)
       });
       if (!delivered) break;
       deliveredCount += 1;
@@ -609,7 +848,7 @@ export class WebSocketHub {
       });
     }
     if (deliveredCount) {
-      console.log(`Delivered ${deliveredCount} queued command(s) to ${lampId}`);
+      console.log(`RF5.4.1 CLOUD flushed=${deliveredCount} lamp=${lampId} generation=${generation}`);
     }
   }
 
@@ -621,16 +860,30 @@ export class WebSocketHub {
       sockets?.delete(socket);
       if (sockets?.size === 0) this.appSockets.delete(socket.meta.userId);
     }
-    if (socket.meta.lampId && this.deviceSockets.get(socket.meta.lampId) === socket) {
+    if (socket.meta.lampId) {
       const lampId = socket.meta.lampId;
-      this.deviceSockets.delete(lampId);
-      this.deviceSendChains.delete(lampId);
-      this.deviceMessageChains.delete(lampId);
-      await prisma.device.updateMany({
-        where: { lampId },
-        data: { online: false, lastSeen: new Date() }
-      });
-      await this.broadcastDeviceEvent(lampId, { type: "deviceOnline", lampId, online: false });
+      const generation = socket.meta.generation;
+      if (generation !== undefined) {
+        const lane = this.deviceLaneKey(lampId, generation);
+        this.deviceMessageChains.delete(lane);
+        const live = this.liveFrameSlots.get(lampId);
+        if (live && live.generation === generation) {
+          this.liveFrameSlots.delete(lampId);
+          this.ephemeralCommands.delete(live.commandId);
+        }
+      }
+
+      // Only the current authoritative generation may publish OFFLINE. A stale
+      // socket closing after it was replaced cannot flip the new session down.
+      if (this.deviceSockets.get(lampId) === socket) {
+        this.deviceSockets.delete(lampId);
+        console.log(`RF5.4.1 CLOUD device_close lamp=${lampId} generation=${generation ?? -1}`);
+        await prisma.device.updateMany({
+          where: { lampId },
+          data: { online: false, lastSeen: new Date() }
+        });
+        await this.broadcastDeviceEvent(lampId, { type: "deviceOnline", lampId, online: false });
+      }
     }
   }
 
@@ -650,7 +903,7 @@ export class WebSocketHub {
 
   private async retryUnacknowledgedCommands(): Promise<void> {
     const now = new Date();
-    const retryBefore = new Date(now.getTime() - 5_000);
+    const retryBefore = new Date(now.getTime() - 2_500);
     const staleControlBefore = new Date(now.getTime() - STALE_CONTROL_AGE_MS);
 
     await prisma.deviceCommand.updateMany({
@@ -659,26 +912,28 @@ export class WebSocketHub {
         action: { in: latestWinsActions },
         createdAt: { lte: staleControlBefore }
       },
-      data: { status: "EXPIRED", errorMessage: "Stale control command expired during RF2 handover protection" }
+      data: { status: "EXPIRED", errorMessage: "Stale control command expired during handover protection" }
     });
 
-    // Expire commands even if a device stays connected forever. A SENT command
-    // is not considered complete until its ACK arrives.
+    // Expire commands even if a device stays connected forever. App-side RF5.4
+    // hedging retries controls with the SAME command ID within the 2-second TTL;
+    // the backend must not add a hidden 5-second control retry loop on top.
     await prisma.deviceCommand.updateMany({
       where: { status: { in: ["PENDING", "SENT"] }, expiresAt: { lte: now } },
       data: { status: "EXPIRED", errorMessage: "Command expired before acknowledgement" }
     });
 
+    // Only requestState has a long enough TTL to benefit from a backend retry.
     const retryable = await prisma.deviceCommand.findMany({
       where: {
         status: "SENT",
         expiresAt: { gt: now },
         deliveredAt: { lte: retryBefore },
-        action: { in: ["setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer", "requestState"] }
+        action: "requestState"
       },
       include: { device: { select: { lampId: true } } },
       orderBy: { deliveredAt: "asc" },
-      take: 50
+      take: 20
     });
 
     for (const command of retryable) {
@@ -687,7 +942,8 @@ export class WebSocketHub {
         commandId: command.commandId,
         action: command.action,
         value: command.valueJson,
-        expiresAt: command.expiresAt.toISOString()
+        expiresAt: command.expiresAt.toISOString(),
+        expiresAtEpochSec: Math.floor(command.expiresAt.getTime() / 1000)
       });
       if (!delivered) continue;
       await prisma.deviceCommand.updateMany({
