@@ -61,6 +61,47 @@ const ingressCommandJoins = new Map<string, IngressCommandJoin>();
 // race. WebSocketHub owns the longer send->ACK/generation lifecycle.
 const commandDispatches = new Map<string, Promise<DispatchResult>>();
 
+// RF5.4.3-R3.3: a same-ID WS/REST fallback can arrive just after the first
+// createAndDispatch promise has completed. Previously that harmless replay
+// reached Prisma, triggered a P2002 log, then recovered by reading the row.
+// Keep a short bounded result cache so the duplicate joins in memory instead.
+// Database commandId uniqueness remains the durable authority after this TTL.
+type RecentCommandResult = {
+  fingerprint: string;
+  result: DispatchResult;
+  expiresAtMs: number;
+};
+const recentCommandResults = new Map<string, RecentCommandResult>();
+const RECENT_COMMAND_RESULT_TTL_MS = 10_000;
+const MAX_RECENT_COMMAND_RESULTS = 4096;
+
+function existingRecentCommandResult(input: CreateInput, commandId: string): DispatchResult | undefined {
+  const recent = recentCommandResults.get(commandId);
+  if (!recent) return undefined;
+  if (recent.expiresAtMs <= Date.now()) {
+    recentCommandResults.delete(commandId);
+    return undefined;
+  }
+  if (recent.fingerprint !== commandFingerprint(input)) {
+    throw new Error("commandId was already used for a different command");
+  }
+  return recent.result;
+}
+
+function rememberRecentCommandResult(input: CreateInput, commandId: string, result: DispatchResult): void {
+  recentCommandResults.delete(commandId);
+  recentCommandResults.set(commandId, {
+    fingerprint: commandFingerprint(input),
+    result,
+    expiresAtMs: Date.now() + RECENT_COMMAND_RESULT_TTL_MS
+  });
+  while (recentCommandResults.size > MAX_RECENT_COMMAND_RESULTS) {
+    const oldest = recentCommandResults.keys().next().value as string | undefined;
+    if (!oldest) break;
+    recentCommandResults.delete(oldest);
+  }
+}
+
 function ttlMsForAction(action: string): number {
   if (latestWinsActions.has(action)) return Math.min(config.commandTtlSeconds * 1000, REALTIME_CONTROL_TTL_MS);
   if (action === "requestState") return Math.min(config.commandTtlSeconds * 1000, REQUEST_STATE_TTL_MS);
@@ -464,6 +505,9 @@ export async function createAndDispatchCommand(input: CreateInput): Promise<Disp
   const superseded = existingSupersededIngressResult(normalizedInput, commandId);
   if (superseded) return superseded;
 
+  const recent = existingRecentCommandResult(normalizedInput, commandId);
+  if (recent) return recent;
+
   const joined = ingressCommandJoins.get(commandId);
   if (joined) {
     if (joined.fingerprint !== fingerprint) throw new Error("commandId was already used for a different command");
@@ -496,7 +540,9 @@ export async function createAndDispatchCommand(input: CreateInput): Promise<Disp
 
   ingressCommandJoins.set(commandId, { fingerprint, promise });
   try {
-    return await promise;
+    const result = await promise;
+    rememberRecentCommandResult(normalizedInput, commandId, result);
+    return result;
   } finally {
     if (ingressCommandJoins.get(commandId)?.promise === promise) ingressCommandJoins.delete(commandId);
   }
