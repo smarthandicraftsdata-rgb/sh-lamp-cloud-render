@@ -16,7 +16,7 @@ const REALTIME_CONTROL_TTL_MS = 2_000;
 const REQUEST_STATE_TTL_MS = 10_000;
 const MAX_DEVICE_INGRESS_QUEUE = 64;
 
-// Only the DB-prepare phase is ordered per device. RF5.4.2 deepest hardening
+// Only the DB-prepare phase is ordered per device. RF5.4.3 deepest hardening
 // uses a real replaceable queue instead of an unremovable Promise chain:
 // for each latest-wins command domain, at most ONE not-yet-started intent is
 // retained. A newer pending power/brightness, fade, timer, or requestState
@@ -200,7 +200,7 @@ function kickSupersededAuditWriter(): void {
         // Keep BOTH queue ownership and the terminal tombstone. A DB outage
         // must never make an old superseded command executable again. Retry
         // only one serial audit operation with bounded exponential backoff.
-        console.error(`RF5.4.2 superseded audit persistence failed id=${job.commandId}`, error);
+        console.error(`RF5.4.3 superseded audit persistence failed id=${job.commandId}`, error);
         const retryAfter = supersededAuditRetryMs;
         supersededAuditRetryMs = Math.min(MAX_SUPERSEDED_AUDIT_RETRY_MS, supersededAuditRetryMs * 2);
         setTimeout(() => {
@@ -331,7 +331,7 @@ async function prepareCommandCore(input: CreateInput, ingressReceivedAt: number)
   try {
     let command;
     if (latestWinsActions.has(input.action)) {
-      // RF5.4.2 normal durable ingress is one database transaction/round-trip,
+      // RF5.4.3 normal durable ingress is one database transaction/round-trip,
       // not findUnique -> updateMany -> create. The unique commandId remains
       // the idempotency arbiter; a same-ID WS/REST race rolls this transaction
       // back and joins the winner below.
@@ -434,7 +434,7 @@ async function dispatchPrepared(input: CreateInput, command: PreparedCommand): P
       data: { status: "SENT", deliveredAt: new Date(), errorMessage: null }
     });
   }
-  console.log(`RF5.4.2 CMD dispatch id=${command.commandId} lamp=${input.lampId} action=${command.action} delivered=${delivered}`);
+  console.log(`RF5.4.3 CMD dispatch id=${command.commandId} lamp=${input.lampId} action=${command.action} delivered=${delivered}`);
   return {
     commandId: command.commandId,
     delivered,
@@ -489,7 +489,7 @@ export async function createAndDispatchCommand(input: CreateInput): Promise<Disp
         onSuperseded: async () => ({ terminal: await resolveSupersededBeforePrepare(normalizedInput, commandId, expiresAt) } as PreparedResult)
       }
     );
-    console.log(`RF5.4.2 CMD db_prepare id=${commandId} lamp=${normalizedInput.lampId} action=${normalizedInput.action} total=${Date.now() - ingressReceivedAt}ms terminal=${"terminal" in prepared}`);
+    console.log(`RF5.4.3 CMD db_prepare id=${commandId} lamp=${normalizedInput.lampId} action=${normalizedInput.action} total=${Date.now() - ingressReceivedAt}ms terminal=${"terminal" in prepared}`);
     if ("terminal" in prepared) return prepared.terminal;
     return await dispatchCoalesced(normalizedInput, prepared.command);
   })();

@@ -100,7 +100,7 @@ const deviceAckSchema = z.object({
 const latestWinsActions = ["toggle", "setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer"];
 const STALE_CONTROL_AGE_MS = 2_000;
 const MAX_SOCKET_BUFFERED_BYTES = 256 * 1024;
-// RF5.4.2 ESP isolation accepts at most 511 bytes of JSON payload plus NUL.
+// RF5.4.3 ESP isolation accepts at most 511 bytes of JSON payload plus NUL.
 // Reject an oversized deviceCommand before it can trigger ESP transport-integrity
 // retirement. Normal SH Lamp control frames are far below this ceiling.
 const MAX_DEVICE_COMMAND_FRAME_BYTES = 511;
@@ -146,7 +146,7 @@ export class WebSocketHub {
   // generation. An old generation can never hold or redirect work for a new
   // authenticated socket.
   private readonly deviceMessageChains = new Map<string, Promise<void>>();
-  // RF5.4.2: network ACK delivery is decoupled from secondary Prisma writes.
+  // RF5.4.3: network ACK delivery is decoupled from secondary Prisma writes.
   // Device state persistence is one in-flight snapshot + one replaceable latest
   // slot per physical lamp. A DB slowdown therefore cannot build an unbounded
   // state queue behind the realtime command path.
@@ -154,7 +154,7 @@ export class WebSocketHub {
   private readonly statePersistenceRunning = new Set<string>();
   private readonly commandContexts = new Map<string, CommandContext>();
   private static readonly MAX_COMMAND_CONTEXTS = 2048;
-  // RF5.4.2: a durable command remains owned by the exact authenticated
+  // RF5.4.3: a durable command remains owned by the exact authenticated
   // device generation after the ws send callback returns. This closes the
   // RF5.4.1 hole where a same-command REST hedge could arrive after the
   // first send promise had already been removed and redispatch the same ID.
@@ -315,7 +315,7 @@ export class WebSocketHub {
         socket.meta.generation = generation;
         clearTimeout(socket.meta.authTimer);
         this.deviceSockets.set(lampId, socket);
-        console.log(`RF5.4.2 CLOUD device_auth lamp=${lampId} generation=${generation}`);
+        console.log(`RF5.4.3 CLOUD device_auth lamp=${lampId} generation=${generation}`);
         await prisma.device.update({
           where: { id: device.id },
           data: { online: true, lastSeen: new Date() }
@@ -368,7 +368,7 @@ export class WebSocketHub {
       }
 
       if (body.type === "liveCommand") {
-        // RF5.4.2 integrated protocol: slider frames use the ordered OUTPUT
+        // RF5.4.3 integrated protocol: slider frames use the ordered OUTPUT
         // command `setOutputState` (power + brightness + rememberedBrightness)
         // so the final OFF/release sequence can make every older live frame
         // stale on the ESP. Only this absolute/reorder-safe action is allowed
@@ -418,7 +418,7 @@ export class WebSocketHub {
         return;
       }
 
-      console.log(`RF5.4.2 CMD app_rx id=${body.commandId || "server"} lamp=${lampId} action=${body.action}`);
+      console.log(`RF5.4.3 CMD app_rx id=${body.commandId || "server"} lamp=${lampId} action=${body.action}`);
       const result = await createAndDispatchCommand({
         hub: this,
         deviceId,
@@ -527,7 +527,7 @@ export class WebSocketHub {
         try {
           await this.persistDeviceState(slot.deviceId, slot.lampId, slot.generation, slot.state);
         } catch (error) {
-          console.error(`RF5.4.2 state persistence failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+          console.error(`RF5.4.3 state persistence failed lamp=${lampId}`, error instanceof Error ? error.message : error);
         }
       }
     } finally {
@@ -628,7 +628,7 @@ export class WebSocketHub {
       id: string; commandId: string; deviceId: string; userId: string | null; expiresAt: Date; createdAt: Date;
     } | null = null;
     if (!context) {
-      // Render restart / old pending command fallback. Normal RF5.4.2 traffic
+      // Render restart / old pending command fallback. Normal RF5.4.3 traffic
       // uses the in-memory context and performs zero Prisma reads before ACK.
       fallbackCommand = await prisma.deviceCommand.findUnique({
         where: { commandId: ack.commandId },
@@ -655,7 +655,7 @@ export class WebSocketHub {
     if (!context) {
       // Unknown ACK: never broadcast it to arbitrary users. It may be from an
       // already-pruned duplicate after a very old reconnect.
-      console.warn(`RF5.4.2 unknown ACK id=${ack.commandId} lamp=${lampId}`);
+      console.warn(`RF5.4.3 unknown ACK id=${ack.commandId} lamp=${lampId}`);
       return;
     }
     if (context.deviceId !== deviceId || context.lampId !== lampId) {
@@ -679,7 +679,7 @@ export class WebSocketHub {
       state: ack.state
     };
     if (context.userId) this.sendToUser(context.userId, fastPayload);
-    console.log(`RF5.4.2 CMD ack_forward id=${ack.commandId} lamp=${lampId} generation=${socket.meta?.generation ?? -1} db_wait=0ms rx_to_app=${Date.now() - receivedAt}ms success=${ack.success} duplicate=${ack.duplicate ?? false}`);
+    console.log(`RF5.4.3 CMD ack_forward id=${ack.commandId} lamp=${lampId} generation=${socket.meta?.generation ?? -1} db_wait=0ms rx_to_app=${Date.now() - receivedAt}ms success=${ack.success} duplicate=${ack.duplicate ?? false} error=${ack.error || "-"} ignored=${ack.ignoredReason || "-"}`);
 
     // The issuing app is already complete. Persist command status immediately
     // and independently so a simultaneous REST hedge can observe ACKNOWLEDGED
@@ -695,14 +695,14 @@ export class WebSocketHub {
         errorMessage: ack.success ? null : ack.error || "Device rejected command"
       }
     }).then(() => {
-      console.log(`RF5.4.2 CMD ack_status_persist id=${ack.commandId} lamp=${lampId} db_total=${Date.now() - statusPersistStartedAt}ms`);
+      console.log(`RF5.4.3 CMD ack_status_persist id=${ack.commandId} lamp=${lampId} db_total=${Date.now() - statusPersistStartedAt}ms`);
       // The terminal DB state is now visible to a later REST hedge, so the
       // in-memory ACK tombstone can be released safely.
       this.releaseDurableInflight(lampId, ack.commandId, socket.meta!.generation!);
     }).catch((error) => {
       // Keep the in-memory terminal ACK tombstone until command expiry if DB
       // persistence fails. Releasing here would reopen duplicate redispatch.
-      console.error(`RF5.4.2 command ACK persistence failed id=${ack.commandId} lamp=${lampId}`, error instanceof Error ? error.message : error);
+      console.error(`RF5.4.3 command ACK persistence failed id=${ack.commandId} lamp=${lampId}`, error instanceof Error ? error.message : error);
     }).finally(() => {
       if (this.commandContexts.get(ack.commandId) === capturedContext) this.commandContexts.delete(ack.commandId);
     });
@@ -714,7 +714,7 @@ export class WebSocketHub {
         where: { id: deviceId },
         data: { online: true, lastSeen: new Date() }
       }).catch((error) => {
-        console.error(`RF5.4.2 device touch failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+        console.error(`RF5.4.3 device touch failed lamp=${lampId}`, error instanceof Error ? error.message : error);
       });
     }
 
@@ -809,7 +809,7 @@ export class WebSocketHub {
       if (existing.terminalAckSeen) {
         // ACK is terminal even if the device reconnects while the asynchronous
         // DB ACK write is still pending. Never reopen delivery after ACK.
-        console.log(`RF5.4.2 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=true`);
+        console.log(`RF5.4.3 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=true`);
         return await existing.sendPromise;
       }
       if (existing.generation !== target.generation) {
@@ -818,7 +818,7 @@ export class WebSocketHub {
         // command ID; ESP idempotency still prevents physical double execution.
         this.durableInflight.delete(key);
       } else if (!allowSameGenerationResend) {
-        console.log(`RF5.4.2 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=false`);
+        console.log(`RF5.4.3 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=false`);
         return await existing.sendPromise;
       }
     }
@@ -829,7 +829,7 @@ export class WebSocketHub {
       // Bounded-memory safety must not weaken transport idempotency. Refuse a
       // new unique durable dispatch rather than evicting a live ownership entry
       // and allowing a later same-ID hedge to resend it.
-      console.warn(`RF5.4.2 CMD inflight_capacity lamp=${lampId} id=${meta.commandId} size=${this.durableInflight.size}`);
+      console.warn(`RF5.4.3 CMD inflight_capacity lamp=${lampId} id=${meta.commandId} size=${this.durableInflight.size}`);
       return false;
     }
 
@@ -927,7 +927,7 @@ export class WebSocketHub {
     const action = typeof info.action === "string" ? info.action : "-";
     const frameBytes = Buffer.byteLength(text);
     if (frameBytes > MAX_DEVICE_COMMAND_FRAME_BYTES) {
-      console.warn(`RF5.4.2 CMD device_frame_oversize id=${commandId} lamp=${lampId} action=${action} generation=${generation} bytes=${frameBytes} limit=${MAX_DEVICE_COMMAND_FRAME_BYTES}`);
+      console.warn(`RF5.4.3 CMD device_frame_oversize id=${commandId} lamp=${lampId} action=${action} generation=${generation} bytes=${frameBytes} limit=${MAX_DEVICE_COMMAND_FRAME_BYTES}`);
       return false;
     }
     const startedAt = Date.now();
@@ -941,7 +941,7 @@ export class WebSocketHub {
         resolve(value);
       };
       const timer = setTimeout(() => {
-        console.warn(`RF5.4.2 CMD device_send_timeout id=${commandId} lamp=${lampId} action=${action} generation=${generation} buffered=${socket.bufferedAmount}`);
+        console.warn(`RF5.4.3 CMD device_send_timeout id=${commandId} lamp=${lampId} action=${action} generation=${generation} buffered=${socket.bufferedAmount}`);
         finish(false);
       }, DEVICE_SEND_CALLBACK_BUDGET_MS);
       try {
@@ -952,7 +952,9 @@ export class WebSocketHub {
             return;
           }
           if (commandId !== "-") {
-            console.log(`RF5.4.2 CMD device_send id=${commandId} lamp=${lampId} action=${action} generation=${generation} accepted=${Date.now() - startedAt}ms bytes=${Buffer.byteLength(text)}`);
+            const expiresAtMs = typeof info.expiresAt === "string" ? Date.parse(info.expiresAt) : Number.NaN;
+            const expiresInMs = Number.isFinite(expiresAtMs) ? Math.round(expiresAtMs - Date.now()) : -1;
+            console.log(`RF5.4.3 CMD device_send id=${commandId} lamp=${lampId} action=${action} generation=${generation} accepted=${Date.now() - startedAt}ms bytes=${Buffer.byteLength(text)} expires_in=${expiresInMs}ms`);
           }
           finish(true);
         });
@@ -1025,7 +1027,7 @@ export class WebSocketHub {
       });
     }
     if (deliveredCount) {
-      console.log(`RF5.4.2 CLOUD flushed=${deliveredCount} lamp=${lampId} generation=${generation}`);
+      console.log(`RF5.4.3 CLOUD flushed=${deliveredCount} lamp=${lampId} generation=${generation}`);
     }
   }
 
@@ -1055,7 +1057,7 @@ export class WebSocketHub {
       // socket closing after it was replaced cannot flip the new session down.
       if (this.deviceSockets.get(lampId) === socket) {
         this.deviceSockets.delete(lampId);
-        console.log(`RF5.4.2 CLOUD device_close lamp=${lampId} generation=${generation ?? -1}`);
+        console.log(`RF5.4.3 CLOUD device_close lamp=${lampId} generation=${generation ?? -1}`);
         await prisma.device.updateMany({
           where: { lampId },
           data: { online: false, lastSeen: new Date() }
