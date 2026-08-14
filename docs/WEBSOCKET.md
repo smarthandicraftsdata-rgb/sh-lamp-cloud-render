@@ -29,9 +29,9 @@ Use for discrete actions and the final value of a continuous control:
 }
 ```
 
-Durable actions: `toggle`, `setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `identify`, `requestState`.
+Durable actions: `toggle`, `setOutputState`, `setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `identify`, `requestState`.
 
-The server persists the command, dispatches it if the device is online, and otherwise leaves it queued until expiry. Safe idempotent SENT commands (`setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `requestState`) are replayed with the same `commandId` after a device reconnect.
+The server persists the command, dispatches it if the device is online, and otherwise leaves it queued until expiry. Safe idempotent SENT commands (`setOutputState`, `setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `requestState`) are replayed with the same `commandId` after a device reconnect.
 
 ## Ephemeral live command
 
@@ -47,7 +47,7 @@ Use only for intermediate high-rate UI motion such as brightness-slider drag:
 }
 ```
 
-`liveCommand` is forwarded directly to an online ESP32 and is not stored as a database command. The app must send one final durable `command` when the drag ends. This keeps the lamp responsive without filling the command table with slider frames.
+`liveCommand` is accepted only for the ordered absolute `setOutputState` action used by the RF5.4.2 slider path. Its value carries power, brightness, remembered brightness, controller/session/sequence identity; it is forwarded directly to an online ESP32 and is not stored as a durable database command. The app sends one final durable `command` when the drag ends. Relative `toggle`, timer/fade/identify, and legacy `setBrightness` must never enter the replaceable live slot.
 
 ## ESP32 state report
 
@@ -113,3 +113,8 @@ Durable ACKs update the command status. ACKs for ephemeral live commands are acc
 ## Heartbeats
 
 Both app and device connections use WebSocket ping/pong. The ESP32 also sends its existing application heartbeat. Dead sockets are terminated and reconnected.
+
+
+## RF5.4.2 route-safety note
+
+The modern BLE/LAN/Cloud route-hedged UI must express ON/OFF as absolute `setOutputState`/`setPower` intent. Relative `toggle` is retained only as a legacy durable action and must not be used for cross-transport hedged UI control, because a relative toggle is not reorder-invariant.

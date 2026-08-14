@@ -1,0 +1,81 @@
+SH Lamp Render RF5.4.2 validation report
+Date: 2026-08-13
+Base: user-supplied sh-lamp-cloud-render-r21a-rf5.4.1-CompileFix1(2).zip
+
+COMPLETED CHECKS
+================
+1. TypeScript parser/transpile syntax check
+   - 14/14 src/**/*.ts files parsed/transpiled with TypeScript 5.8.3
+   - 0 syntax diagnostics
+
+2. Source-contract checks
+   - 21/21 PASS
+   - toggle remains in output latest-wins domain
+   - duplicate command ownership remains user-bound
+   - durable DB insert/supersession transaction preserved
+   - device TTL propagation preserved
+   - generation-bound durable in-flight map exists
+   - bounded in-flight capacity fails closed instead of evicting live ownership
+   - ownership is installed before socket send microtask
+   - same-ID hedge joins existing operation
+   - terminal ACK is checked before generation-loss recovery
+   - terminal ACK blocks all same-ID redispatch, including explicit requestState retry
+   - validated ACK marks transport terminal before app/DB completion
+   - in-flight ownership releases only after terminal DB visibility
+   - failed ACK persistence retains terminal tombstone until expiry
+   - generation loss releases only unacknowledged ownership
+   - reconnect flush passes through durable guard
+   - requestState retry passes through durable guard
+   - 300 ms WebSocket send callback budget preserved
+   - bounded state persistence preserved
+   - generation-specific inbound lane preserved
+   - authoritative socket-generation checks preserved
+   - app ACK remains ahead of Prisma command-status persistence
+
+3. Behavioral in-flight simulator
+   - concurrent WS + REST same ID (1000 callers): PASS, one device send
+   - hedge after send callback / before ACK: PASS, one device send
+   - ACK before DB persistence: PASS, one device send
+   - ACK -> generation replacement -> DB still pending: PASS, one device send
+   - failed socket send releases ownership for retry: PASS
+   - genuine unacknowledged generation loss permits exactly one recovery send: PASS
+   - requestState same-generation retry preserved before ACK and blocked after ACK: PASS
+   - expiry cleanup: PASS
+   - capacity fail-closed test at 4096 live entries: PASS; existing ownership not evicted
+   - 500 different command IDs remain independent: PASS
+   - 2,000 randomized same-ID hedge/generation rounds: PASS
+
+4. Deterministic randomized stress
+   - 100,000 rounds: PASS
+   - seed: 0x5a42c0de
+   - covers same-generation hedge storms, ACK-before-DB, ACK+reconnect,
+     unacknowledged generation recovery, and requestState retry/ACK termination
+
+5. Regression preservation against exact supplied RF5.4.1 CompileFix1 source
+   - access.ts: byte-for-byte unchanged
+   - auth.ts: byte-for-byte unchanged
+   - config.ts: byte-for-byte unchanged
+   - db.ts: byte-for-byte unchanged
+   - errors.ts: byte-for-byte unchanged
+   - rateLimit.ts: byte-for-byte unchanged
+   - routes/authRoutes.ts: byte-for-byte unchanged
+   - routes/deviceRoutes.ts: byte-for-byte unchanged
+   - routes/health.ts: byte-for-byte unchanged
+   - routes/homeRoutes.ts: byte-for-byte unchanged
+   - security.ts: byte-for-byte unchanged
+   - server.ts: byte-for-byte unchanged
+   - commandService.ts behavior unchanged; only RF5.4.1 -> RF5.4.2 comments/log labels
+   - websocketHub.ts contains the targeted transport-lifecycle change
+   - Prisma schema unchanged; no migration required
+
+LIMITATIONS / NOT CLAIMED
+=========================
+- Full npm dependency build / `tsc -p tsconfig.json` could not be completed in this
+  environment because the supplied ZIP has no node_modules and npm registry access is
+  unavailable. A raw project build therefore stops on missing @prisma/client, ws, zod,
+  Express and Node typings. This is not counted as a successful dependency build.
+- No live PostgreSQL, Render WebSocket, ESP32, router or iPhone integration test was possible.
+- This report validates the complete Render backend correction only.
+- The mandatory RF5.4.2 ESP Cloud-isolation and iOS physical-vs-cloud identity changes cannot
+  be safely merged into complete flashable/installable projects until the exact RF5.4.1 HAC
+  ESP .ino and iOS Hardening ZIP are provided.

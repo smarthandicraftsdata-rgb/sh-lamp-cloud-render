@@ -76,4 +76,7 @@ The response contains `deviceSecret` and `claimCode` exactly once. Save both.
   ```
 - `DELETE /api/devices/:lampId` — releases ownership and returns a new claim code.
 
-Allowed actions: `toggle`, `setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `identify`, `requestState`.
+Allowed actions: `toggle`, `setOutputState`, `setPower`, `setBrightness`, `setFadeMode`, `setTimer`, `identify`, `requestState`.
+
+
+RF5.4.2 integrated protocol: `liveCommand` is only valid for ordered absolute `setOutputState`. The same OUTPUT controller/session/sequence domain carries power + brightness + remembered brightness so a newer durable release/OFF makes delayed live frames stale on the ESP. Relative `toggle` and legacy `setBrightness` are not valid live actions.

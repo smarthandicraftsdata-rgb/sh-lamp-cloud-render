@@ -37,6 +37,16 @@ type CommandContext = {
   registeredAt: number;
 };
 
+type DurableInflight = {
+  lampId: string;
+  commandId: string;
+  generation: number;
+  expiresAt: number;
+  startedAt: number;
+  sendPromise: Promise<boolean>;
+  terminalAckSeen: boolean;
+};
+
 const appAuthSchema = z.object({ type: z.literal("auth"), token: z.string().min(20) });
 const deviceAuthSchema = z.object({
   type: z.literal("auth"),
@@ -90,6 +100,10 @@ const deviceAckSchema = z.object({
 const latestWinsActions = ["toggle", "setOutputState", "setPower", "setBrightness", "setFadeMode", "setTimer"];
 const STALE_CONTROL_AGE_MS = 2_000;
 const MAX_SOCKET_BUFFERED_BYTES = 256 * 1024;
+// RF5.4.2 ESP isolation accepts at most 511 bytes of JSON payload plus NUL.
+// Reject an oversized deviceCommand before it can trigger ESP transport-integrity
+// retirement. Normal SH Lamp control frames are far below this ceiling.
+const MAX_DEVICE_COMMAND_FRAME_BYTES = 511;
 const DEVICE_SEND_CALLBACK_BUDGET_MS = 300;
 const APP_ACCESS_CACHE_TTL_MS = 10_000;
 
@@ -132,7 +146,7 @@ export class WebSocketHub {
   // generation. An old generation can never hold or redirect work for a new
   // authenticated socket.
   private readonly deviceMessageChains = new Map<string, Promise<void>>();
-  // RF5.4.1: network ACK delivery is decoupled from secondary Prisma writes.
+  // RF5.4.2: network ACK delivery is decoupled from secondary Prisma writes.
   // Device state persistence is one in-flight snapshot + one replaceable latest
   // slot per physical lamp. A DB slowdown therefore cannot build an unbounded
   // state queue behind the realtime command path.
@@ -140,6 +154,14 @@ export class WebSocketHub {
   private readonly statePersistenceRunning = new Set<string>();
   private readonly commandContexts = new Map<string, CommandContext>();
   private static readonly MAX_COMMAND_CONTEXTS = 2048;
+  // RF5.4.2: a durable command remains owned by the exact authenticated
+  // device generation after the ws send callback returns. This closes the
+  // RF5.4.1 hole where a same-command REST hedge could arrive after the
+  // first send promise had already been removed and redispatch the same ID.
+  // Key is lampId + commandId; generation is stored in the entry so a real
+  // generation loss can deliberately release the command for recovery.
+  private readonly durableInflight = new Map<string, DurableInflight>();
+  private static readonly MAX_DURABLE_INFLIGHT = 4096;
   // Live slider traffic has exactly one in-flight frame plus one replaceable
   // pending slot per lamp. It cannot build an unbounded queue behind durable
   // controls.
@@ -293,7 +315,7 @@ export class WebSocketHub {
         socket.meta.generation = generation;
         clearTimeout(socket.meta.authTimer);
         this.deviceSockets.set(lampId, socket);
-        console.log(`RF5.4.1 CLOUD device_auth lamp=${lampId} generation=${generation}`);
+        console.log(`RF5.4.2 CLOUD device_auth lamp=${lampId} generation=${generation}`);
         await prisma.device.update({
           where: { id: device.id },
           data: { online: true, lastSeen: new Date() }
@@ -346,6 +368,20 @@ export class WebSocketHub {
       }
 
       if (body.type === "liveCommand") {
+        // RF5.4.2 integrated protocol: slider frames use the ordered OUTPUT
+        // command `setOutputState` (power + brightness + rememberedBrightness)
+        // so the final OFF/release sequence can make every older live frame
+        // stale on the ESP. Only this absolute/reorder-safe action is allowed
+        // in the replaceable live slot. Relative toggle/timer/fade/identify and
+        // legacy setBrightness must never enter this coalescing path.
+        if (body.action !== "setOutputState") {
+          this.send(socket, {
+            type: "error",
+            code: "LIVE_ACTION_NOT_ALLOWED",
+            message: "liveCommand is only valid for ordered setOutputState"
+          });
+          return;
+        }
         // Slider drag traffic is intentionally ephemeral. It gets one in-flight
         // frame and one replaceable latest slot per lamp, never a FIFO backlog.
         const commandId = body.commandId || randomCommandId();
@@ -382,7 +418,7 @@ export class WebSocketHub {
         return;
       }
 
-      console.log(`RF5.4.1 CMD app_rx id=${body.commandId || "server"} lamp=${lampId} action=${body.action}`);
+      console.log(`RF5.4.2 CMD app_rx id=${body.commandId || "server"} lamp=${lampId} action=${body.action}`);
       const result = await createAndDispatchCommand({
         hub: this,
         deviceId,
@@ -491,7 +527,7 @@ export class WebSocketHub {
         try {
           await this.persistDeviceState(slot.deviceId, slot.lampId, slot.generation, slot.state);
         } catch (error) {
-          console.error(`RF5.4.1 state persistence failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+          console.error(`RF5.4.2 state persistence failed lamp=${lampId}`, error instanceof Error ? error.message : error);
         }
       }
     } finally {
@@ -592,7 +628,7 @@ export class WebSocketHub {
       id: string; commandId: string; deviceId: string; userId: string | null; expiresAt: Date; createdAt: Date;
     } | null = null;
     if (!context) {
-      // Render restart / old pending command fallback. Normal RF5.4.1 traffic
+      // Render restart / old pending command fallback. Normal RF5.4.2 traffic
       // uses the in-memory context and performs zero Prisma reads before ACK.
       fallbackCommand = await prisma.deviceCommand.findUnique({
         where: { commandId: ack.commandId },
@@ -619,7 +655,7 @@ export class WebSocketHub {
     if (!context) {
       // Unknown ACK: never broadcast it to arbitrary users. It may be from an
       // already-pruned duplicate after a very old reconnect.
-      console.warn(`RF5.4.1 unknown ACK id=${ack.commandId} lamp=${lampId}`);
+      console.warn(`RF5.4.2 unknown ACK id=${ack.commandId} lamp=${lampId}`);
       return;
     }
     if (context.deviceId !== deviceId || context.lampId !== lampId) {
@@ -627,6 +663,8 @@ export class WebSocketHub {
       console.warn(`Rejected wrong-device ACK ${ack.commandId} from ${lampId}`);
       return;
     }
+
+    this.markDurableInflightTerminalAck(lampId, ack.commandId, socket.meta!.generation!);
 
     const fastPayload = {
       type: "ack",
@@ -641,7 +679,7 @@ export class WebSocketHub {
       state: ack.state
     };
     if (context.userId) this.sendToUser(context.userId, fastPayload);
-    console.log(`RF5.4.1 CMD ack_forward id=${ack.commandId} lamp=${lampId} generation=${socket.meta?.generation ?? -1} db_wait=0ms rx_to_app=${Date.now() - receivedAt}ms success=${ack.success} duplicate=${ack.duplicate ?? false}`);
+    console.log(`RF5.4.2 CMD ack_forward id=${ack.commandId} lamp=${lampId} generation=${socket.meta?.generation ?? -1} db_wait=0ms rx_to_app=${Date.now() - receivedAt}ms success=${ack.success} duplicate=${ack.duplicate ?? false}`);
 
     // The issuing app is already complete. Persist command status immediately
     // and independently so a simultaneous REST hedge can observe ACKNOWLEDGED
@@ -657,9 +695,14 @@ export class WebSocketHub {
         errorMessage: ack.success ? null : ack.error || "Device rejected command"
       }
     }).then(() => {
-      console.log(`RF5.4.1 CMD ack_status_persist id=${ack.commandId} lamp=${lampId} db_total=${Date.now() - statusPersistStartedAt}ms`);
+      console.log(`RF5.4.2 CMD ack_status_persist id=${ack.commandId} lamp=${lampId} db_total=${Date.now() - statusPersistStartedAt}ms`);
+      // The terminal DB state is now visible to a later REST hedge, so the
+      // in-memory ACK tombstone can be released safely.
+      this.releaseDurableInflight(lampId, ack.commandId, socket.meta!.generation!);
     }).catch((error) => {
-      console.error(`RF5.4.1 command ACK persistence failed id=${ack.commandId} lamp=${lampId}`, error instanceof Error ? error.message : error);
+      // Keep the in-memory terminal ACK tombstone until command expiry if DB
+      // persistence fails. Releasing here would reopen duplicate redispatch.
+      console.error(`RF5.4.2 command ACK persistence failed id=${ack.commandId} lamp=${lampId}`, error instanceof Error ? error.message : error);
     }).finally(() => {
       if (this.commandContexts.get(ack.commandId) === capturedContext) this.commandContexts.delete(ack.commandId);
     });
@@ -671,7 +714,7 @@ export class WebSocketHub {
         where: { id: deviceId },
         data: { online: true, lastSeen: new Date() }
       }).catch((error) => {
-        console.error(`RF5.4.1 device touch failed lamp=${lampId}`, error instanceof Error ? error.message : error);
+        console.error(`RF5.4.2 device touch failed lamp=${lampId}`, error instanceof Error ? error.message : error);
       });
     }
 
@@ -679,6 +722,61 @@ export class WebSocketHub {
 
   private deviceLaneKey(lampId: string, generation: number): string {
     return `${lampId}#${generation}`;
+  }
+
+  private durableInflightKey(lampId: string, commandId: string): string {
+    return `${lampId}#${commandId}`;
+  }
+
+  private durablePayloadMeta(payload: unknown): { commandId?: string; expiresAt?: number } {
+    if (!payload || typeof payload !== "object") return {};
+    const frame = payload as Record<string, unknown>;
+    const commandId = typeof frame.commandId === "string" ? frame.commandId : undefined;
+    let expiresAt: number | undefined;
+    if (typeof frame.expiresAt === "string") {
+      const parsed = Date.parse(frame.expiresAt);
+      if (Number.isFinite(parsed)) expiresAt = parsed;
+    } else if (typeof frame.expiresAtEpochSec === "number" && Number.isFinite(frame.expiresAtEpochSec)) {
+      expiresAt = Math.floor(frame.expiresAtEpochSec * 1000);
+    }
+    return { commandId, expiresAt };
+  }
+
+  private pruneDurableInflight(now = Date.now()): void {
+    for (const [key, entry] of this.durableInflight) {
+      // Keep an ACK tombstone until the DB status write has had a chance to
+      // complete; otherwise a REST hedge racing the async ACK persistence can
+      // redispatch during that tiny window. Expiry remains the hard ceiling.
+      if (entry.expiresAt <= now) this.durableInflight.delete(key);
+    }
+    // Never evict a still-live ownership entry merely to make room. Doing so
+    // could reopen same-ID delivery while the original command is still in
+    // flight. Capacity is enforced fail-closed when admitting a NEW command.
+  }
+
+  private releaseDurableInflight(lampId: string, commandId: string, generation?: number): void {
+    const key = this.durableInflightKey(lampId, commandId);
+    const entry = this.durableInflight.get(key);
+    if (!entry) return;
+    if (generation !== undefined && entry.generation !== generation) return;
+    this.durableInflight.delete(key);
+  }
+
+  private releaseDurableInflightGeneration(lampId: string, generation: number): void {
+    for (const [key, entry] of this.durableInflight) {
+      if (entry.lampId === lampId && entry.generation === generation && !entry.terminalAckSeen) {
+        // Generation loss is a retry release condition only while the command
+        // is still unacknowledged. A validated ACK is already terminal and must
+        // survive reconnect until its DB status is visible (or TTL expires).
+        this.durableInflight.delete(key);
+      }
+    }
+  }
+
+  private markDurableInflightTerminalAck(lampId: string, commandId: string, generation: number): void {
+    const entry = this.durableInflight.get(this.durableInflightKey(lampId, commandId));
+    if (!entry || entry.generation !== generation) return;
+    entry.terminalAckSeen = true;
   }
 
   private currentDeviceTarget(lampId: string): DeviceTarget | undefined {
@@ -691,7 +789,79 @@ export class WebSocketHub {
   async sendCommandToDevice(lampId: string, payload: unknown): Promise<boolean> {
     const target = this.currentDeviceTarget(lampId);
     if (!target) return false;
-    return await this.sendCommandToBoundTarget(lampId, target, payload);
+    return await this.sendDurableCommandToBoundTarget(lampId, target, payload);
+  }
+
+  private async sendDurableCommandToBoundTarget(
+    lampId: string,
+    target: DeviceTarget,
+    payload: unknown,
+    allowSameGenerationResend = false
+  ): Promise<boolean> {
+    const meta = this.durablePayloadMeta(payload);
+    if (!meta.commandId) return await this.sendCommandToBoundTarget(lampId, target, payload);
+
+    const now = Date.now();
+    this.pruneDurableInflight(now);
+    const key = this.durableInflightKey(lampId, meta.commandId);
+    const existing = this.durableInflight.get(key);
+    if (existing) {
+      if (existing.terminalAckSeen) {
+        // ACK is terminal even if the device reconnects while the asynchronous
+        // DB ACK write is still pending. Never reopen delivery after ACK.
+        console.log(`RF5.4.2 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=true`);
+        return await existing.sendPromise;
+      }
+      if (existing.generation !== target.generation) {
+        // The exact socket generation that owned this UNACKNOWLEDGED attempt
+        // disappeared. Recovery on the new generation is allowed with the SAME
+        // command ID; ESP idempotency still prevents physical double execution.
+        this.durableInflight.delete(key);
+      } else if (!allowSameGenerationResend) {
+        console.log(`RF5.4.2 CMD inflight_join id=${meta.commandId} lamp=${lampId} generation=${target.generation} terminalAck=false`);
+        return await existing.sendPromise;
+      }
+    }
+
+    const expiresAt = meta.expiresAt ?? (now + 10_000);
+    if (expiresAt <= now) return false;
+    if (this.durableInflight.size >= WebSocketHub.MAX_DURABLE_INFLIGHT) {
+      // Bounded-memory safety must not weaken transport idempotency. Refuse a
+      // new unique durable dispatch rather than evicting a live ownership entry
+      // and allowing a later same-ID hedge to resend it.
+      console.warn(`RF5.4.2 CMD inflight_capacity lamp=${lampId} id=${meta.commandId} size=${this.durableInflight.size}`);
+      return false;
+    }
+
+    // Defer the actual socket.send() to the next microtask. The ownership entry
+    // is therefore installed BEFORE any bytes can be sent, closing the
+    // WS/REST race window at the transport boundary.
+    const sendPromise = Promise.resolve().then(() =>
+      this.sendCommandToBoundTarget(lampId, target, payload)
+    );
+    const entry: DurableInflight = {
+      lampId,
+      commandId: meta.commandId,
+      generation: target.generation,
+      expiresAt,
+      startedAt: now,
+      sendPromise,
+      terminalAckSeen: false
+    };
+    this.durableInflight.set(key, entry);
+
+    void sendPromise.then((delivered) => {
+      // A failed send owns nothing: release immediately so a hedge/recovery
+      // attempt can try again. A successful send remains in-flight until ACK,
+      // expiry/cancellation, or generation loss.
+      if (!delivered && this.durableInflight.get(key) === entry) {
+        this.durableInflight.delete(key);
+      }
+    }, () => {
+      if (this.durableInflight.get(key) === entry) this.durableInflight.delete(key);
+    });
+
+    return await sendPromise;
   }
 
   private async sendCommandToBoundTarget(lampId: string, target: DeviceTarget, payload: unknown): Promise<boolean> {
@@ -755,6 +925,11 @@ export class WebSocketHub {
     const info = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
     const commandId = typeof info.commandId === "string" ? info.commandId : "-";
     const action = typeof info.action === "string" ? info.action : "-";
+    const frameBytes = Buffer.byteLength(text);
+    if (frameBytes > MAX_DEVICE_COMMAND_FRAME_BYTES) {
+      console.warn(`RF5.4.2 CMD device_frame_oversize id=${commandId} lamp=${lampId} action=${action} generation=${generation} bytes=${frameBytes} limit=${MAX_DEVICE_COMMAND_FRAME_BYTES}`);
+      return false;
+    }
     const startedAt = Date.now();
 
     return await new Promise<boolean>((resolve) => {
@@ -766,7 +941,7 @@ export class WebSocketHub {
         resolve(value);
       };
       const timer = setTimeout(() => {
-        console.warn(`RF5.4.1 CMD device_send_timeout id=${commandId} lamp=${lampId} action=${action} generation=${generation} buffered=${socket.bufferedAmount}`);
+        console.warn(`RF5.4.2 CMD device_send_timeout id=${commandId} lamp=${lampId} action=${action} generation=${generation} buffered=${socket.bufferedAmount}`);
         finish(false);
       }, DEVICE_SEND_CALLBACK_BUDGET_MS);
       try {
@@ -777,7 +952,7 @@ export class WebSocketHub {
             return;
           }
           if (commandId !== "-") {
-            console.log(`RF5.4.1 CMD device_send id=${commandId} lamp=${lampId} action=${action} generation=${generation} accepted=${Date.now() - startedAt}ms bytes=${Buffer.byteLength(text)}`);
+            console.log(`RF5.4.2 CMD device_send id=${commandId} lamp=${lampId} action=${action} generation=${generation} accepted=${Date.now() - startedAt}ms bytes=${Buffer.byteLength(text)}`);
           }
           finish(true);
         });
@@ -791,6 +966,8 @@ export class WebSocketHub {
   disconnectDevice(lampId: string, code = 1000, reason = "Disconnected"): void {
     const existing = this.deviceSockets.get(lampId);
     if (existing) {
+      const generation = existing.meta?.generation;
+      if (generation !== undefined) this.releaseDurableInflightGeneration(lampId, generation);
       this.deviceSockets.delete(lampId);
       existing.close(code, reason);
     }
@@ -832,7 +1009,7 @@ export class WebSocketHub {
     let deliveredCount = 0;
     for (const command of pending) {
       if (this.deviceSockets.get(lampId) !== socket || socket.meta?.generation !== generation) break;
-      const delivered = await this.sendCommandToBoundTarget(lampId, target, {
+      const delivered = await this.sendDurableCommandToBoundTarget(lampId, target, {
         type: "deviceCommand",
         commandId: command.commandId,
         action: command.action,
@@ -848,7 +1025,7 @@ export class WebSocketHub {
       });
     }
     if (deliveredCount) {
-      console.log(`RF5.4.1 CLOUD flushed=${deliveredCount} lamp=${lampId} generation=${generation}`);
+      console.log(`RF5.4.2 CLOUD flushed=${deliveredCount} lamp=${lampId} generation=${generation}`);
     }
   }
 
@@ -866,6 +1043,7 @@ export class WebSocketHub {
       if (generation !== undefined) {
         const lane = this.deviceLaneKey(lampId, generation);
         this.deviceMessageChains.delete(lane);
+        this.releaseDurableInflightGeneration(lampId, generation);
         const live = this.liveFrameSlots.get(lampId);
         if (live && live.generation === generation) {
           this.liveFrameSlots.delete(lampId);
@@ -877,7 +1055,7 @@ export class WebSocketHub {
       // socket closing after it was replaced cannot flip the new session down.
       if (this.deviceSockets.get(lampId) === socket) {
         this.deviceSockets.delete(lampId);
-        console.log(`RF5.4.1 CLOUD device_close lamp=${lampId} generation=${generation ?? -1}`);
+        console.log(`RF5.4.2 CLOUD device_close lamp=${lampId} generation=${generation ?? -1}`);
         await prisma.device.updateMany({
           where: { lampId },
           data: { online: false, lastSeen: new Date() }
@@ -902,6 +1080,7 @@ export class WebSocketHub {
   }
 
   private async retryUnacknowledgedCommands(): Promise<void> {
+    this.pruneDurableInflight();
     const now = new Date();
     const retryBefore = new Date(now.getTime() - 2_500);
     const staleControlBefore = new Date(now.getTime() - STALE_CONTROL_AGE_MS);
@@ -937,14 +1116,16 @@ export class WebSocketHub {
     });
 
     for (const command of retryable) {
-      const delivered = await this.sendCommandToDevice(command.device.lampId, {
+      const retryTarget = this.currentDeviceTarget(command.device.lampId);
+      if (!retryTarget) continue;
+      const delivered = await this.sendDurableCommandToBoundTarget(command.device.lampId, retryTarget, {
         type: "deviceCommand",
         commandId: command.commandId,
         action: command.action,
         value: command.valueJson,
         expiresAt: command.expiresAt.toISOString(),
         expiresAtEpochSec: Math.floor(command.expiresAt.getTime() / 1000)
-      });
+      }, true);
       if (!delivered) continue;
       await prisma.deviceCommand.updateMany({
         where: { id: command.id, status: "SENT" },
