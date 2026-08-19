@@ -16,7 +16,10 @@ const envSchema = z.object({
   PASSWORD_RESET_TOKEN_TTL_MINUTES: z.coerce.number().int().min(5).max(60).default(15),
   PASSWORD_RESET_DEBUG_RETURN_TOKEN: booleanText,
   RESEND_API_KEY: z.string().min(10).optional(),
-  PASSWORD_RESET_FROM_EMAIL: z.string().min(3).optional()
+  PASSWORD_RESET_FROM_EMAIL: z.string().min(3).optional(),
+  SHADOW_AUTH_ENABLED: booleanText,
+  DEVICE_CREDENTIAL_MASTER_KEY_B64: z.string().min(1).optional(),
+  DEVICE_CREDENTIAL_WRAPPING_KEY_VERSION: z.coerce.number().int().min(1).max(65535).default(1)
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -28,6 +31,17 @@ if (!parsed.success) {
 const allowedOrigins = parsed.data.CORS_ORIGINS.split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+let deviceCredentialMasterKey: Buffer | null = null;
+if (parsed.data.DEVICE_CREDENTIAL_MASTER_KEY_B64) {
+  deviceCredentialMasterKey = Buffer.from(parsed.data.DEVICE_CREDENTIAL_MASTER_KEY_B64.trim(), "base64");
+  if (deviceCredentialMasterKey.length !== 32) {
+    throw new Error("DEVICE_CREDENTIAL_MASTER_KEY_B64 must decode to exactly 32 bytes");
+  }
+}
+if (parsed.data.SHADOW_AUTH_ENABLED && !deviceCredentialMasterKey) {
+  throw new Error("SHADOW_AUTH_ENABLED=true requires DEVICE_CREDENTIAL_MASTER_KEY_B64");
+}
 
 export const config = {
   nodeEnv: parsed.data.NODE_ENV,
@@ -43,5 +57,8 @@ export const config = {
   passwordResetTokenTtlMinutes: parsed.data.PASSWORD_RESET_TOKEN_TTL_MINUTES,
   passwordResetDebugReturnToken: parsed.data.PASSWORD_RESET_DEBUG_RETURN_TOKEN,
   resendApiKey: parsed.data.RESEND_API_KEY,
-  passwordResetFromEmail: parsed.data.PASSWORD_RESET_FROM_EMAIL
+  passwordResetFromEmail: parsed.data.PASSWORD_RESET_FROM_EMAIL,
+  shadowAuthEnabled: parsed.data.SHADOW_AUTH_ENABLED,
+  deviceCredentialMasterKey,
+  deviceCredentialWrappingKeyVersion: parsed.data.DEVICE_CREDENTIAL_WRAPPING_KEY_VERSION
 } as const;

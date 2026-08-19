@@ -14,7 +14,8 @@
     "db:generate": "prisma generate",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test:p2b": "node tools/rf7_p2b_contract_test.mjs"
   },
   "dependencies": {
     "@prisma/client": "6.19.3",

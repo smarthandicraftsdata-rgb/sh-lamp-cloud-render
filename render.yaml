@@ -28,6 +28,10 @@ services:
         value: "*"
       - key: COMMAND_TTL_SECONDS
         value: "120"
+      - key: SHADOW_AUTH_ENABLED
+        value: "false"
+      - key: DEVICE_CREDENTIAL_WRAPPING_KEY_VERSION
+        value: "1"
 
 databases:
   - name: sh-lamp-postgres

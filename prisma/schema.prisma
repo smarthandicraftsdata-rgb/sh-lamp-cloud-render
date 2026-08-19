@@ -92,6 +92,10 @@ model Device {
   online           Boolean         @default(false)
   lastSeen         DateTime?
   firmwareVersion  String?
+  canonicalDeviceId String?        @unique @db.Uuid
+  identityProtocol  String?
+  identityState     String?
+  identityKeyVersion Int?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
   owner             User?           @relation("DeviceOwner", fields: [ownerId], references: [id], onDelete: SetNull)
@@ -100,10 +104,32 @@ model Device {
   state             DeviceState?
   commands          DeviceCommand[]
   activities        ActivityEvent[]
+  credentials       DeviceCredential[]
 
   @@index([ownerId])
   @@index([homeId])
   @@index([roomId])
+}
+
+
+model DeviceCredential {
+  id                 String   @id @default(uuid()) @db.Uuid
+  deviceId           String   @db.Uuid
+  protocol           String
+  keyVersion         Int
+  status             String   @default("SHADOW")
+  cipher             String   @default("AES-256-GCM")
+  secretCiphertext   Bytes
+  secretIv           Bytes
+  secretAuthTag      Bytes
+  wrappingKeyVersion Int      @default(1)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  revokedAt          DateTime?
+  device             Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, protocol, keyVersion])
+  @@index([deviceId, status])
 }
 
 model DeviceState {

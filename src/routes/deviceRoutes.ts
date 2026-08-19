@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import type { Prisma } from "@prisma/client";
@@ -16,6 +17,8 @@ import { config } from "../config";
 import { createRateLimiter } from "../rateLimit";
 import { allowedActions, createAndDispatchCommand } from "../commandService";
 import type { WebSocketHub } from "../websocketHub";
+import { encryptDeviceSecret } from "../credentialEnvelope";
+import { SH_AUTH_PROTOCOL } from "../shadowAuth";
 
 const lampIdParam = z.string().transform(normalizeLampId);
 const uuid = z.string().uuid();
@@ -23,6 +26,12 @@ const uuid = z.string().uuid();
 export function createDeviceRouter(hub: WebSocketHub): Router {
   const router = Router();
   const adminLimiter = createRateLimiter(10, 15 * 60_000);
+
+  const requireAdminSetupKey = (key: string | undefined): void => {
+    if (!key || !secretsEqual(key, hashSecret(config.adminSetupKey))) {
+      throw new AppError(403, "ADMIN_KEY_INVALID", "Valid x-admin-key is required");
+    }
+  };
 
   const adminDeviceSchema = z.object({
     lampId: z.string(),
@@ -34,10 +43,7 @@ export function createDeviceRouter(hub: WebSocketHub): Router {
     "/api/admin/devices",
     adminLimiter,
     asyncRoute(async (req, res) => {
-      const key = req.header("x-admin-key");
-      if (!key || !secretsEqual(key, hashSecret(config.adminSetupKey))) {
-        throw new AppError(403, "ADMIN_KEY_INVALID", "Valid x-admin-key is required");
-      }
+      requireAdminSetupKey(req.header("x-admin-key"));
 
       const body = adminDeviceSchema.parse(req.body);
       const lampId = normalizeLampId(body.lampId);
@@ -61,6 +67,148 @@ export function createDeviceRouter(hub: WebSocketHub): Router {
         credentials: { lampId, deviceSecret, claimCode },
         warning: "Save these credentials now. The server stores only hashes and cannot show them again."
       });
+    })
+  );
+
+  const shadowCredentialSchema = z.object({
+    canonicalDeviceId: z.string().trim().toLowerCase().regex(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      "canonicalDeviceId must be UUIDv4"
+    ),
+    keyVersion: z.number().int().min(1).max(65535).default(1),
+    authKeyHex: z.string().trim().regex(/^[0-9a-fA-F]{64}$/, "authKeyHex must be exactly 32 bytes / 64 hex characters")
+  });
+
+  router.post(
+    "/api/admin/devices/:lampId/shadow-auth",
+    adminLimiter,
+    asyncRoute(async (req, res) => {
+      requireAdminSetupKey(req.header("x-admin-key"));
+      if (!config.deviceCredentialMasterKey) {
+        throw new AppError(503, "SHADOW_AUTH_MASTER_KEY_MISSING", "DEVICE_CREDENTIAL_MASTER_KEY_B64 is not configured");
+      }
+
+      const lampId = lampIdParam.parse(req.params.lampId);
+      const body = shadowCredentialSchema.parse(req.body);
+      const canonicalDeviceId = body.canonicalDeviceId.toLowerCase();
+      const authKey = Buffer.from(body.authKeyHex, "hex");
+      // Minimize plaintext lifetime. JavaScript strings cannot be securely zeroed,
+      // so redact references immediately after decoding and never log/request-echo them.
+      body.authKeyHex = "";
+      if (req.body && typeof req.body === "object") (req.body as Record<string, unknown>).authKeyHex = "[redacted]";
+      const fingerprint = crypto.createHash("sha256").update(authKey).digest("hex").slice(0, 16);
+
+      try {
+        const device = await prisma.device.findUnique({ where: { lampId }, select: { id: true, lampId: true } });
+        if (!device) throw new AppError(404, "DEVICE_NOT_REGISTERED", "Lamp is not registered in the cloud");
+
+        const uuidOwner = await prisma.device.findUnique({
+          where: { canonicalDeviceId },
+          select: { id: true, lampId: true }
+        });
+        if (uuidOwner && uuidOwner.id !== device.id) {
+          throw new AppError(409, "CANONICAL_DEVICE_ID_IN_USE", "Canonical device UUID is already assigned to another lamp");
+        }
+
+        const encrypted = encryptDeviceSecret(
+          config.deviceCredentialMasterKey,
+          device.id,
+          canonicalDeviceId,
+          SH_AUTH_PROTOCOL,
+          body.keyVersion,
+          config.deviceCredentialWrappingKeyVersion,
+          authKey
+        );
+
+        await prisma.$transaction(async (tx) => {
+          await tx.device.update({
+            where: { id: device.id },
+            data: {
+              canonicalDeviceId,
+              identityProtocol: SH_AUTH_PROTOCOL,
+              identityState: "SHADOW",
+              identityKeyVersion: body.keyVersion
+            }
+          });
+          await tx.deviceCredential.upsert({
+            where: {
+              deviceId_protocol_keyVersion: {
+                deviceId: device.id,
+                protocol: SH_AUTH_PROTOCOL,
+                keyVersion: body.keyVersion
+              }
+            },
+            create: {
+              deviceId: device.id,
+              protocol: SH_AUTH_PROTOCOL,
+              keyVersion: body.keyVersion,
+              status: "SHADOW",
+              cipher: encrypted.cipher,
+              secretCiphertext: encrypted.ciphertext,
+              secretIv: encrypted.iv,
+              secretAuthTag: encrypted.authTag,
+              wrappingKeyVersion: config.deviceCredentialWrappingKeyVersion
+            },
+            update: {
+              status: "SHADOW",
+              cipher: encrypted.cipher,
+              secretCiphertext: encrypted.ciphertext,
+              secretIv: encrypted.iv,
+              secretAuthTag: encrypted.authTag,
+              wrappingKeyVersion: config.deviceCredentialWrappingKeyVersion,
+              revokedAt: null
+            }
+          });
+        });
+
+        res.status(201).json({
+          ok: true,
+          shadowOnly: true,
+          legacyLampId: device.lampId,
+          canonicalDeviceId,
+          protocol: SH_AUTH_PROTOCOL,
+          keyVersion: body.keyVersion,
+          keyFingerprint: fingerprint,
+          credentialState: "SHADOW",
+          warning: "Shadow credential stored encrypted. Existing legacy WebSocket authentication remains authoritative."
+        });
+      } finally {
+        authKey.fill(0);
+      }
+    })
+  );
+
+  router.get(
+    "/api/admin/devices/:lampId/shadow-auth",
+    adminLimiter,
+    asyncRoute(async (req, res) => {
+      requireAdminSetupKey(req.header("x-admin-key"));
+      const lampId = lampIdParam.parse(req.params.lampId);
+      const device = await prisma.device.findUnique({
+        where: { lampId },
+        select: {
+          lampId: true,
+          canonicalDeviceId: true,
+          identityProtocol: true,
+          identityState: true,
+          identityKeyVersion: true,
+          credentials: {
+            select: {
+              protocol: true,
+              keyVersion: true,
+              status: true,
+              cipher: true,
+              wrappingKeyVersion: true,
+              createdAt: true,
+              updatedAt: true,
+              revokedAt: true
+            },
+            orderBy: { keyVersion: "desc" }
+          }
+        }
+      });
+      if (!device) throw new AppError(404, "DEVICE_NOT_REGISTERED", "Lamp is not registered in the cloud");
+      res.json({ ok: true, shadowOnly: true, device });
     })
   );
 

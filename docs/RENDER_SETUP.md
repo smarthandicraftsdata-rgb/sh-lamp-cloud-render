@@ -57,3 +57,16 @@ Expected response contains:
 ```json
 {"ok":true,"service":"sh-lamp-cloud-render"}
 ```
+
+## RF7 P2B shadow-auth variables
+
+Deploy P2B initially with:
+
+- `SHADOW_AUTH_ENABLED` = `false`
+- `DEVICE_CREDENTIAL_WRAPPING_KEY_VERSION` = `1`
+
+Before provisioning a P2A credential, manually add:
+
+- `DEVICE_CREDENTIAL_MASTER_KEY_B64` = a random 32-byte key encoded in base64
+
+Do not place `DEVICE_CREDENTIAL_MASTER_KEY_B64` in GitHub. After provisioning and verifying the credential fingerprint, set `SHADOW_AUTH_ENABLED=true` only when testing P2C firmware.

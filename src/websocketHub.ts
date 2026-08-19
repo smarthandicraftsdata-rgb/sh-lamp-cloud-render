@@ -5,6 +5,8 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { normalizeLampId, randomCommandId, secretsEqual, verifyAccessToken } from "./security";
 import { allowedActions, createAndDispatchCommand } from "./commandService";
+import { isShadowAuthMessage } from "./shadowAuth";
+import { ShadowAuthService } from "./shadowAuthService";
 
 interface SocketMeta {
   kind: "app" | "device";
@@ -146,6 +148,10 @@ export class WebSocketHub {
   // generation. An old generation can never hold or redirect work for a new
   // authenticated socket.
   private readonly deviceMessageChains = new Map<string, Promise<void>>();
+  // RF7 P2B: SH-AUTH-V1 shadow traffic has a separate per-device lane so
+  // credential DB/decryption work can never delay ACK/state control traffic.
+  private readonly shadowMessageChains = new Map<string, Promise<void>>();
+  private readonly shadowAuth = new ShadowAuthService();
   // RF5.4.3: network ACK delivery is decoupled from secondary Prisma writes.
   // Device state persistence is one in-flight snapshot + one replaceable latest
   // slot per physical lamp. A DB slowdown therefore cannot build an unbounded
@@ -234,8 +240,53 @@ export class WebSocketHub {
 
     if (socket.meta.kind === "app") {
       await this.handleAppMessage(socket, parsed);
+    } else if (isShadowAuthMessage(parsed)) {
+      await this.enqueueShadowAuthMessage(socket, parsed);
     } else {
       await this.enqueueDeviceMessage(socket, parsed);
+    }
+  }
+
+  private async enqueueShadowAuthMessage(socket: ManagedSocket, parsed: unknown): Promise<void> {
+    const lampId = socket.meta?.lampId;
+    const legacyDeviceDbId = socket.meta?.deviceId;
+    const generation = socket.meta?.generation;
+    if (!lampId || !legacyDeviceDbId || generation === undefined) return;
+    const lane = `shadow:${this.deviceLaneKey(lampId, generation)}`;
+    const previous = this.shadowMessageChains.get(lane) || Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.deviceSockets.get(lampId) !== socket ||
+            socket.meta?.generation !== generation ||
+            socket.readyState !== WebSocket.OPEN ||
+            socket.meta?.authenticated !== true) return;
+
+        const type = typeof parsed === "object" && parsed !== null ? (parsed as { type?: string }).type : undefined;
+        try {
+          const context = { socketGeneration: generation, legacyDeviceDbId, lampId };
+          const response = type === "authV2Hello"
+            ? await this.shadowAuth.handleHello(parsed, context)
+            : await this.shadowAuth.handleProof(parsed, context);
+          this.send(socket, response);
+        } catch (error) {
+          console.error(`RF7 P2B shadow auth internal error lamp=${lampId} generation=${generation}`, error instanceof Error ? error.message : error);
+          this.send(socket, {
+            type: "authV2ShadowResult",
+            protocol: "SH-AUTH-V1",
+            deviceId: "",
+            keyVersion: 1,
+            ok: false,
+            shadowOnly: true,
+            code: "INTERNAL_ERROR"
+          });
+        }
+      });
+    this.shadowMessageChains.set(lane, next);
+    try {
+      await next;
+    } finally {
+      if (this.shadowMessageChains.get(lane) === next) this.shadowMessageChains.delete(lane);
     }
   }
 
@@ -1045,6 +1096,8 @@ export class WebSocketHub {
       if (generation !== undefined) {
         const lane = this.deviceLaneKey(lampId, generation);
         this.deviceMessageChains.delete(lane);
+        this.shadowMessageChains.delete(`shadow:${lane}`);
+        if (socket.meta.deviceId) this.shadowAuth.onSocketClosed(generation, socket.meta.deviceId);
         this.releaseDurableInflightGeneration(lampId, generation);
         const live = this.liveFrameSlots.get(lampId);
         if (live && live.generation === generation) {

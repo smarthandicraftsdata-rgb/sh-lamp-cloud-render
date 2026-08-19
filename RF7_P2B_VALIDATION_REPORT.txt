@@ -1,0 +1,47 @@
+RF7 P2B BACKEND INTEGRATION VALIDATION
+Date: 2026-08-19
+Base: user-uploaded "sh-lamp-cloud-render latest files.zip"
+
+Architecture invariants
+- Legacy device auth remains the only socket authority: PASS
+- SH-AUTH-V1 handled only after legacy authentication: PASS
+- Shadow PASS does not grant authority: PASS
+- Shadow FAIL does not disconnect device / mark offline: PASS
+- Shadow messages use a separate per-device generation lane from ACK/state traffic: PASS
+- Challenge bound to canonical UUID + legacy Device DB id + keyVersion + socket generation: PASS
+- 30-second challenge lifetime: PASS
+- One proof attempt consumes challenge: PASS
+- Replayed consumed challenge distinguished/rejected: PASS
+- Socket close destroys its outstanding challenge: PASS
+- HMAC comparison uses crypto.timingSafeEqual: PASS
+- Credential is AES-256-GCM wrapped before DB storage: PASS
+- Admin status endpoint never selects ciphertext/IV/tag: PASS
+- Raw authKey is never returned or logged: PASS
+- Existing commandService.ts unchanged: PASS
+- Existing security.ts unchanged: PASS
+- Existing db.ts unchanged: PASS
+- Existing server.ts unchanged: PASS
+
+Database migration
+- Additive nullable canonical identity fields only: PASS
+- New DeviceCredential table only: PASS
+- No DROP/TRUNCATE/DELETE FROM/SET NOT NULL/RENAME: PASS
+
+Protocol regression
+- Canonical packet length: 75 bytes PASS
+- Public vector HMAC: 3b50437746a3b4f808a07fd08a081c584d5cbcfdcb815a3904e78e10c586554c PASS
+- AES-256-GCM envelope round-trip: PASS
+
+Source validation
+- TypeScript syntax/transpile pass across src/**/*.ts: PASS
+- git diff --check: PASS
+- package.json parse: PASS
+- render.yaml parse: PASS (when PyYAML available in validation environment)
+
+Environment safety
+- SHADOW_AUTH_ENABLED defaults false: PASS
+- Missing master key is allowed while feature disabled: PASS
+- Enabling shadow auth without a 32-byte base64 master key fails startup explicitly: PASS
+
+Important limitation
+- A full `npm run build` with Prisma-generated types was not executed in this sandbox because npm dependency installation was unavailable/timed out. The actual Render build remains the authoritative TypeScript+Prisma integration compile gate. Deploy first with SHADOW_AUTH_ENABLED=false; if Render build reports any compiler/Prisma error, do not enable P2B and use that exact build log for correction.
