@@ -7,10 +7,12 @@ import { normalizeLampId, randomCommandId, secretsEqual, verifyAccessToken } fro
 import { allowedActions, createAndDispatchCommand } from "./commandService";
 import { isShadowAuthMessage } from "./shadowAuth";
 import { ShadowAuthService } from "./shadowAuthService";
+import { AppError } from "./errors";
 
 interface SocketMeta {
   kind: "app" | "device";
   authenticated: boolean;
+  authPending?: boolean;
   userId?: string;
   lampId?: string;
   deviceId?: string;
@@ -203,7 +205,7 @@ export class WebSocketHub {
   }
 
   private accept(socket: ManagedSocket, _request: IncomingMessage, kind: "app" | "device"): void {
-    const authTimer = setTimeout(() => socket.close(4003, "Authentication timeout"), 10_000);
+    const authTimer = setTimeout(() => socket.close(1013, "Authentication timed out; retry connection"), 10_000);
     socket.meta = { kind, authenticated: false, alive: true, authTimer };
     socket.on("pong", () => { if (socket.meta) socket.meta.alive = true; });
     socket.on("message", (data) => void this.onMessage(socket, data.toString()));
@@ -315,22 +317,26 @@ export class WebSocketHub {
   }
 
   private async authenticate(socket: ManagedSocket, parsed: unknown): Promise<void> {
-    if (!socket.meta) return;
+    if (!socket.meta || socket.meta.authPending || socket.meta.authenticated) return;
+    socket.meta.authPending = true;
     try {
       if (socket.meta.kind === "app") {
         const body = appAuthSchema.parse(parsed);
         const token = verifyAccessToken(body.token);
+        const devices = await prisma.device.findMany({
+          where: { OR: [{ ownerId: token.sub }, { home: { members: { some: { userId: token.sub } } } }] },
+          include: { state: true, home: true, room: true },
+          orderBy: { displayName: "asc" }
+        });
+        // Publish authentication only after async setup succeeds. An expired
+        // handshake or duplicate auth message cannot leak across accounts.
+        if(socket.readyState !== WebSocket.OPEN) return;
         socket.meta.authenticated = true;
         socket.meta.userId = token.sub;
         clearTimeout(socket.meta.authTimer);
         const sockets = this.appSockets.get(token.sub) || new Set<ManagedSocket>();
         sockets.add(socket);
         this.appSockets.set(token.sub, sockets);
-        const devices = await prisma.device.findMany({
-          where: { OR: [{ ownerId: token.sub }, { home: { members: { some: { userId: token.sub } } } }] },
-          include: { state: true, home: true, room: true },
-          orderBy: { displayName: "asc" }
-        });
         // RF5.3: authorization for the lamps visible at authentication time is
         // cached on this authenticated socket. Slider liveCommand frames no
         // longer perform one Prisma authorization query per finger movement.
@@ -352,6 +358,7 @@ export class WebSocketHub {
         const body = deviceAuthSchema.parse(parsed);
         const lampId = normalizeLampId(body.lampId);
         const device = await prisma.device.findUnique({ where: { lampId }, include: { state: true } });
+        if(socket.readyState !== WebSocket.OPEN) return;
         if (!device || !secretsEqual(body.deviceSecret, device.deviceSecretHash)) {
           socket.close(4003, "Invalid device credentials");
           return;
@@ -377,7 +384,11 @@ export class WebSocketHub {
       }
     } catch (error) {
       console.warn("WebSocket authentication failed", error instanceof Error ? error.message : error);
-      socket.close(4003, "Authentication failed");
+      const rejected = error instanceof z.ZodError ||
+        (error instanceof AppError && [400, 401, 403].includes(error.status));
+      socket.close(rejected ? 4003 : 1011, rejected ? "Authentication failed" : "Temporary server error; reconnect");
+    } finally {
+      if(socket.meta) socket.meta.authPending = false;
     }
   }
 

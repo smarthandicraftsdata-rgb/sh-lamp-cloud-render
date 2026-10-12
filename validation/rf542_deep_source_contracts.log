@@ -1,0 +1,28 @@
+PASS toggle remains legacy output latest-wins member
+PASS durable duplicate ownership user-bound
+PASS durable latest-wins prepare transactional
+PASS numeric device expiry propagated
+PASS liveCommand hard-restricted to ordered setOutputState
+PASS durable inflight map
+PASS inflight capacity fails closed
+PASS ownership installed before send microtask
+PASS terminal ACK blocks redispatch
+PASS unacked generation loss releases recovery ownership
+PASS generation cleanup preserves terminal ACK tombstone
+PASS ACK terminal marker bound to socket generation
+PASS ACK tombstone released after DB visibility
+PASS DB failure preserves ACK tombstone
+PASS reconnect flush goes through durable guard
+PASS requestState retry goes through durable guard
+PASS device send callback budget bounded
+PASS socket backpressure bounded
+PASS device command frame bounded to ESP RX capacity
+PASS state persistence bounded latest-slot architecture
+PASS device inbound chain generation-scoped
+PASS authoritative generation checked before device send
+PASS stale device socket cannot publish offline
+PASS backend retry limited to requestState query
+PASS ACK forwarded before status persistence
+RF5.4.2 deep source contracts: ALL PASS count=25
+(node:14) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)

@@ -1,0 +1,6 @@
+RF7 P2B protocol vector: PASS
+Canonical message bytes: 75
+HMAC: 3b50437746a3b4f808a07fd08a081c584d5cbcfdcb815a3904e78e10c586554c
+AES-256-GCM credential envelope: PASS
+(node:38) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)

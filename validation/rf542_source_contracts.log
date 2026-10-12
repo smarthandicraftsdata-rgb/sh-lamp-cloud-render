@@ -1,0 +1,24 @@
+PASS toggle remains in output latest-wins domain
+PASS duplicate command ownership remains user-bound
+PASS durable insert/supersession remains transactional
+PASS device TTL propagation remains present
+PASS generation-bound durable in-flight map exists
+PASS durable in-flight capacity fails closed instead of evicting live ownership
+PASS in-flight ownership is installed before socket send microtask
+PASS same-ID hedge joins existing device operation
+PASS terminal ACK is checked before generation mismatch recovery
+PASS terminal ACK blocks all redispatch before generation/retry logic
+PASS validated ACK marks transport terminal before app/DB completion
+PASS in-flight releases after terminal DB visibility
+PASS failed ACK persistence cannot reopen redispatch
+PASS generation loss releases only unacknowledged ownership
+PASS reconnect flush passes through durable guard
+PASS requestState retry passes through durable guard
+PASS bounded WebSocket send callback budget preserved
+PASS bounded state persistence architecture preserved
+PASS generation-specific inbound message lane preserved
+PASS authoritative device generation checks preserved
+PASS ACK forwarding remains ahead of Prisma status persistence
+RF5.4.2 source contracts: ALL PASS
+(node:6) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)

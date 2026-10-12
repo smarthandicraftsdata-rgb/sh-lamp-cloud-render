@@ -1,33 +1,17 @@
-SH LAMP CLOUD — EXACT GITHUB UPLOAD
+SH LAMP CLOUD — REPLACE YOUR EXISTING BRANCH
 
-1. Create a new empty GitHub repository named:
-   sh-lamp-cloud-render
+Extract the ZIP and open the sh-lamp-cloud-render folder.
+Copy every item inside that folder to the existing repository root, including
+.github, .gitignore, .node-version and .env.example.
+Do not upload the ZIP itself or nest the entire folder inside the repository.
 
-2. Extract SH_Lamp_Phase3A_Render_Backend_GitHub.zip.
+Repository: https://github.com/smarthandicraftsdata-rgb/sh-lamp-cloud-render
+Default branch: main
 
-3. Open the extracted folder and upload ALL items inside it to the repository root.
-   Do not upload only the ZIP file.
-   Do not place the files inside another nested folder.
+The five-minute scheduler activates only after the workflow is committed to
+the default branch. Use Actions > Render keep-alive to confirm its first run.
+If the web upload omits the hidden .github folder, create the workflow files
+with Add file > Create new file using their complete supplied paths.
 
-The GitHub repository root must directly contain:
-
-  .env.example
-  .gitignore
-  .node-version
-  FILE_LIST.txt
-  README.md
-  UPLOAD_TO_GITHUB.txt
-  VALIDATION_REPORT.txt
-  package.json
-  render.yaml
-  tsconfig.json
-  docs/
-  prisma/
-  src/
-
-4. Commit to the main branch.
-
-5. Follow docs/RENDER_SETUP.md exactly.
-
-Never upload a real .env file, DATABASE_URL, ACCESS_TOKEN_SECRET, ADMIN_SETUP_KEY,
-deviceSecret, access token, refresh token, or customer password to GitHub.
+Follow README_FIRST_UPDATE.md for deployment commands and migration details.
+Keep existing Render secrets unchanged. Do not commit real secrets or .env.

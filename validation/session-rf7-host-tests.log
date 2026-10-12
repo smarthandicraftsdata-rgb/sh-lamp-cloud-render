@@ -1,0 +1,137 @@
+(node:7) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)
+TAP version 13
+# (node:14) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: compiled RF7 code retains the canonical 75-byte proof vector
+ok 1 - compiled RF7 code retains the canonical 75-byte proof vector
+  ---
+  duration_ms: 4.214745
+  type: 'test'
+  ...
+# Subtest: compiled credential envelope rejects ciphertext and device-context tampering
+ok 2 - compiled credential envelope rejects ciphertext and device-context tampering
+  ---
+  duration_ms: 9.306349
+  type: 'test'
+  ...
+# Subtest: challenge expiry, replay rejection and generation-specific cleanup remain intact
+ok 3 - challenge expiry, replay rejection and generation-specific cleanup remain intact
+  ---
+  duration_ms: 2.391797
+  type: 'test'
+  ...
+# Subtest: disabled shadow authentication remains non-authoritative
+ok 4 - disabled shadow authentication remains non-authoritative
+  ---
+  duration_ms: 3.437172
+  type: 'test'
+  ...
+# Subtest: slow shadow authentication does not block device ACKs or revoke legacy authority
+ok 5 - slow shadow authentication does not block device ACKs or revoke legacy authority
+  ---
+  duration_ms: 17.48494
+  type: 'test'
+  ...
+# Subtest: concurrent app authentication cannot switch socket accounts
+ok 6 - concurrent app authentication cannot switch socket accounts
+  ---
+  duration_ms: 19.301164
+  type: 'test'
+  ...
+# Subtest: a closed handshake cannot publish authenticated access later
+ok 7 - a closed handshake cannot publish authenticated access later
+  ---
+  duration_ms: 1.944866
+  type: 'test'
+  ...
+# (node:34) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# WebSocket authentication failed simulated database outage
+# WebSocket authentication failed Access token is invalid or expired
+# Subtest: lost response retry returns same successor without extending deadline
+ok 8 - lost response retry returns same successor without extending deadline
+  ---
+  duration_ms: 38.576609
+  type: 'test'
+  ...
+# Subtest: parallel refresh creates exactly one successor
+ok 9 - parallel refresh creates exactly one successor
+  ---
+  duration_ms: 22.393671
+  type: 'test'
+  ...
+# Subtest: expired retry, expired token and unknown token are rejected
+ok 10 - expired retry, expired token and unknown token are rejected
+  ---
+  duration_ms: 6.547028
+  type: 'test'
+  ...
+# Subtest: logout with spent parent revokes successor but preserves another device session
+ok 11 - logout with spent parent revokes successor but preserves another device session
+  ---
+  duration_ms: 5.501039
+  type: 'test'
+  ...
+# Subtest: logout races refresh without allowing an active successor
+ok 12 - logout races refresh without allowing an active successor
+  ---
+  duration_ms: 2.571248
+  type: 'test'
+  ...
+# Subtest: password reset revokes all sessions and prevents stale login issuance
+ok 13 - password reset revokes all sessions and prevents stale login issuance
+  ---
+  duration_ms: 7.332958
+  type: 'test'
+  ...
+# Subtest: valid legacy tokens migrate lazily; revoked legacy tokens remain rejected
+ok 14 - valid legacy tokens migrate lazily; revoked legacy tokens remain rejected
+  ---
+  duration_ms: 15.787343
+  type: 'test'
+  ...
+# Subtest: corrupt recovery data produces retryable 503, never authentication rejection
+ok 15 - corrupt recovery data produces retryable 503, never authentication rejection
+  ---
+  duration_ms: 3.985701
+  type: 'test'
+  ...
+# Subtest: a consumed successor cannot be resurrected by its parent
+ok 16 - a consumed successor cannot be resurrected by its parent
+  ---
+  duration_ms: 5.040165
+  type: 'test'
+  ...
+# Subtest: WebSocket auth separates database failures from rejected credentials
+ok 17 - WebSocket auth separates database failures from rejected credentials
+  ---
+  duration_ms: 21.505974
+  type: 'test'
+  ...
+# Unhandled server error Error: simulated database outage
+#     at prisma.refreshToken.findUnique (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/tests/session.test.cjs:97:100)
+#     at refreshSession (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/dist/sessionService.js:99:51)
+#     at /workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/dist/routes/authRoutes.js:191:77
+#     at /workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/dist/errors.js:21:30
+#     at Layer.handleRequest (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/node_modules/router/lib/layer.js:152:17)
+#     at next (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/node_modules/router/lib/route.js:157:13)
+#     at /workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/dist/rateLimit.js:33:9
+#     at Layer.handleRequest (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/node_modules/router/lib/layer.js:152:17)
+#     at next (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/node_modules/router/lib/route.js:157:13)
+#     at Route.dispatch (/workspace/scratch/2a8a8905c307/tmp/render_full_update/sh-lamp-cloud-render-rf7-p2b-shadow-auth/node_modules/router/lib/route.js:117:3)
+# Subtest: HTTP refresh handler preserves its JSON contract and transient errors return 500
+ok 18 - HTTP refresh handler preserves its JSON contract and transient errors return 500
+  ---
+  duration_ms: 464.372805
+  type: 'test'
+  ...
+1..18
+# tests 18
+# suites 0
+# pass 18
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 2055.228249

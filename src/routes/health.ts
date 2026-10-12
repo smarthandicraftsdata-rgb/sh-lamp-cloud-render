@@ -11,7 +11,7 @@ healthRouter.get(
     res.json({
       ok: true,
       service: "sh-lamp-cloud-render",
-      version: "0.1.0",
+      version: "0.1.1",
       time: new Date().toISOString()
     });
   })

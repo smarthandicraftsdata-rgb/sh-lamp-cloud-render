@@ -4,7 +4,6 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { asyncRoute, AppError } from "../errors";
 import {
-  createAccessToken,
   createOpaqueToken,
   hashPassword,
   hashSecret,
@@ -14,6 +13,7 @@ import {
 import { config } from "../config";
 import { createRateLimiter } from "../rateLimit";
 import { getUserId, requireAuth, type AuthenticatedRequest } from "../auth";
+import { issueSession, refreshSession, logoutSession, lockSessionUser, revokeUserSessions } from "../sessionService";
 
 export const authRouter = Router();
 const authLimiter = createRateLimiter(20, 15 * 60_000);
@@ -40,20 +40,6 @@ const passwordResetConfirmSchema = z.object({
 
 function publicUser(user: { id: string; email: string; displayName: string; createdAt: Date }) {
   return { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt };
-}
-
-async function issueSession(user: { id: string; email: string }) {
-  const refreshToken = createOpaqueToken();
-  const expiresAt = new Date(Date.now() + config.refreshTokenTtlDays * 24 * 60 * 60 * 1000);
-  await prisma.refreshToken.create({
-    data: { userId: user.id, tokenHash: hashSecret(refreshToken), expiresAt }
-  });
-  return {
-    accessToken: createAccessToken(user),
-    accessTokenExpiresIn: config.accessTokenTtlSeconds,
-    refreshToken,
-    refreshTokenExpiresAt: expiresAt.toISOString()
-  };
 }
 
 async function sendPasswordResetEmail(email: string, token: string): Promise<boolean> {
@@ -217,6 +203,8 @@ authRouter.post(
 
     const passwordHash = await hashPassword(body.newPassword);
     await prisma.$transaction(async (tx) => {
+      if(!await lockSessionUser(tx, stored.userId))
+        throw new AppError(400, "INVALID_RESET_TOKEN", "Reset code is invalid, expired, or already used");
       const consumed = await tx.passwordResetToken.updateMany({
         where: { id: stored.id, usedAt: null, expiresAt: { gt: now } },
         data: { usedAt: now }
@@ -237,10 +225,7 @@ authRouter.post(
         where: { userId: stored.userId, usedAt: null },
         data: { usedAt: now }
       });
-      await tx.refreshToken.updateMany({
-        where: { userId: stored.userId, revokedAt: null },
-        data: { revokedAt: now }
-      });
+      await revokeUserSessions(tx, stored.userId, now);
       await tx.activityEvent.create({
         data: {
           type: "PASSWORD_RESET",
@@ -262,38 +247,7 @@ authRouter.post(
   authLimiter,
   asyncRoute(async (req, res) => {
     const { refreshToken } = refreshSchema.parse(req.body);
-    const currentHash = hashSecret(refreshToken);
-    const stored = await prisma.refreshToken.findUnique({
-      where: { tokenHash: currentHash },
-      include: { user: true }
-    });
-
-    if (!stored || stored.revokedAt || stored.expiresAt <= new Date()) {
-      throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token is invalid or expired");
-    }
-
-    const nextRefreshToken = createOpaqueToken();
-    const nextExpiresAt = new Date(Date.now() + config.refreshTokenTtlDays * 24 * 60 * 60 * 1000);
-    await prisma.$transaction([
-      prisma.refreshToken.update({ where: { id: stored.id }, data: { revokedAt: new Date() } }),
-      prisma.refreshToken.create({
-        data: {
-          userId: stored.userId,
-          tokenHash: hashSecret(nextRefreshToken),
-          expiresAt: nextExpiresAt
-        }
-      })
-    ]);
-
-    res.json({
-      ok: true,
-      session: {
-        accessToken: createAccessToken(stored.user),
-        accessTokenExpiresIn: config.accessTokenTtlSeconds,
-        refreshToken: nextRefreshToken,
-        refreshTokenExpiresAt: nextExpiresAt.toISOString()
-      }
-    });
+    res.json({ ok: true, session: await refreshSession(refreshToken) });
   })
 );
 
@@ -301,10 +255,7 @@ authRouter.post(
   "/api/auth/logout",
   asyncRoute(async (req, res) => {
     const { refreshToken } = refreshSchema.parse(req.body);
-    await prisma.refreshToken.updateMany({
-      where: { tokenHash: hashSecret(refreshToken), revokedAt: null },
-      data: { revokedAt: new Date() }
-    });
+    await logoutSession(refreshToken);
     res.json({ ok: true });
   })
 );

@@ -1,0 +1,40 @@
+name: Render keep-alive
+
+on:
+  schedule:
+    # Every five minutes, offset from the busy start of the hour.
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/render-keep-alive.yml'
+
+permissions: {}
+
+concurrency:
+  group: render-keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Ping SH Lamp health endpoint
+        env:
+          HEALTH_URL: https://sh-lamp-cloud-render.onrender.com/health
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Allow cold starts and retry temporary network/server errors.
+          # Do not access accounts, lamps, or database endpoints.
+          curl --fail --silent --show-error \
+            --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 90 \
+            --retry 2 --retry-delay 5 --retry-max-time 180 \
+            --retry-connrefused \
+            --output /dev/null \
+            --write-out 'SH Lamp health HTTP %{http_code}\n' \
+            "${HEALTH_URL}"
+

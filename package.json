@@ -1,6 +1,6 @@
 {
   "name": "sh-lamp-cloud-render",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "SH Lamp Phase 3A Render cloud proof-of-concept backend",
   "main": "dist/server.js",
@@ -15,7 +15,10 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test:p2b": "node tools/rf7_p2b_contract_test.mjs"
+    "test:p2b": "node tools/rf7_p2b_contract_test.mjs",
+    "test:sessions": "npm run build && node --test --test-concurrency=1 tests/session.test.cjs",
+    "test:sessions:model": "npm run build && SESSION_TEST_MODEL=1 TEST_DATABASE_URL=postgresql://test:test@localhost:5432/test node --test --test-concurrency=1 tests/session.test.cjs",
+    "test:rf7-integration": "node --test --test-concurrency=1 tests/rf7-session-integration.test.cjs"
   },
   "dependencies": {
     "@prisma/client": "6.19.3",

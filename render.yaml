@@ -22,6 +22,8 @@ services:
         value: "900"
       - key: REFRESH_TOKEN_TTL_DAYS
         value: "30"
+      - key: REFRESH_RETRY_GRACE_SECONDS
+        value: "120"
       - key: BCRYPT_ROUNDS
         value: "10"
       - key: CORS_ORIGINS

@@ -1,0 +1,14 @@
+PASS concurrent WS + REST same ID => one device send
+PASS hedge after send callback but before ACK => no redispatch
+PASS ACK-before-DB tombstone closes async persistence race
+PASS ACK tombstone survives device generation replacement before DB persistence
+PASS failed socket send releases ownership for retry
+PASS device generation loss deliberately permits recovery send
+PASS requestState same-generation retry allowed before ACK only
+PASS expiry prunes ownership
+PASS capacity fails closed without evicting live ownership
+PASS different command IDs are never collapsed
+PASS randomized same-ID hedge storm preserves one send per generation
+RF5.4.2 backend in-flight acceptance: ALL PASS
+(node:22) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)
